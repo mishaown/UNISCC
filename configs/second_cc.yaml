@@ -1,0 +1,170 @@
+# UniSCC Configuration for SECOND-CC Dataset
+# Semantic Change Detection + Change Captioning
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+dataset:
+  name: "SECOND-CC"
+  root: "E:/CD-Experiment/Datasets/SECOND-CC-AUG"
+
+  train_split: "train"
+  val_split: "val"
+  test_split: "test"
+
+  image_size: 256
+  num_channels: 3
+
+  # 7 semantic classes for SCD
+  # Note: The model outputs 49 transition classes (7x7) for change detection
+  # Transition encoding: change_class = sem_a * 7 + sem_b
+  # Where sem_a is the class in image A and sem_b is the class in image B
+  num_classes: 7
+  num_transition_classes: 49  # 7x7, computed automatically by the model
+  class_names:
+    - "background"        # 0: unchanged background/no_change
+    - "low_vegetation"    # 1
+    - "non_vegetated_ground"  # 2
+    - "tree"              # 3
+    - "water"             # 4
+    - "building"          # 5
+    - "playground"        # 6
+  
+  # Caption settings
+  max_caption_length: 50
+  min_word_freq: 5
+  vocab_size: 10000
+  num_captions_per_image: 5
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+model:
+  name: "UniSCC"
+  
+  encoder:
+    backbone: "swin_base_patch4_window7_224"
+    pretrained: "imagenet22k"
+    feature_dim: 1024
+  
+  tdt:  # Temporal Difference Transformer
+    num_layers: 3
+    num_heads: 8
+    hidden_dim: 512
+    dropout: 0.1
+  
+  lsp:  # Learnable Semantic Prompts
+    num_classes: 7
+    prompt_dim: 512
+    num_prompts_per_class: 4
+    dropout: 0.1
+  
+  scd_head:
+    in_channels: 512
+    hidden_channels: 256
+    num_classes: 7
+    use_batch_norm: true
+  
+  caption_decoder:
+    num_layers: 6
+    num_heads: 8
+    hidden_dim: 512
+    vocab_size: 10000
+    max_length: 50
+    dropout: 0.1
+
+# =============================================================================
+# Loss Configuration
+# =============================================================================
+loss:
+  scd_weight: 1.0
+  caption_weight: 1.0
+  consistency_weight: 0.5
+  
+  scd_loss:
+    type: "combined"  # cross_entropy, focal, dice, combined
+    focal_gamma: 2.0
+    dice_smooth: 1.0
+    ignore_index: 255
+  
+  caption_loss:
+    type: "cross_entropy"
+    label_smoothing: 0.1
+    ignore_index: 0
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  batch_size: 4
+  num_epochs: 10
+  num_workers: 8
+  
+  optimizer:
+    type: "AdamW"
+    lr: 1.0e-4
+    weight_decay: 0.01
+  
+  scheduler:
+    type: "CosineAnnealingWarmRestarts"
+    T_0: 5
+    T_mult: 2
+    eta_min: 1.0e-6
+  
+  warmup_epochs: 2
+  gradient_clip: 1.0
+  
+  amp:
+    enabled: true
+
+# =============================================================================
+# Augmentation
+# =============================================================================
+augmentation:
+  train:
+    horizontal_flip: 0.5
+    vertical_flip: 0.5
+    rotation: 0.3
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.05
+      p: 0.3
+    gaussian_blur: 0.2
+  
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  batch_size: 16
+  beam_size: 5
+  
+  scd_metrics: ["SeK", "mIoU", "F1", "OA"]
+  caption_metrics: ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"]
+
+# =============================================================================
+# Checkpointing & Logging
+# =============================================================================
+checkpoint:
+  save_dir: "./checkpoints/second_cc"
+  save_every: 5
+  monitor: "val_loss"
+
+logging:
+  log_dir: "./logs/second_cc"
+  log_every: 50
+  use_tensorboard: true
+
+# =============================================================================
+# Hardware
+# =============================================================================
+hardware:
+  device: "cuda"
+  gpu_ids: [0]
+
+seed: 42
