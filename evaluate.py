@@ -7,8 +7,8 @@ Evaluates trained models on:
 - LEVIR-MCI: Precision, Recall, F1, IoU, OA, Kappa + BLEU, METEOR, ROUGE-L, CIDEr
 
 Usage:
-    python evaluate.py --config configs/second_cc.yaml --checkpoint checkpoints/best.pth
-    python evaluate.py --config configs/levir_mci.yaml --checkpoint checkpoints/best.pth
+  python evaluate.py --config configs/second_cc.yaml --checkpoint checkpoints/second_cc/best.pth
+  python evaluate.py --config configs/levir_mci.yaml --checkpoint checkpoints/levir_mci/best.pth
 """
 
 import os
@@ -65,16 +65,13 @@ class Evaluator:
         self._load_model(checkpoint_path)
         
         # Initialize metrics
-        # SECOND-CC uses SemanticChangeMetrics with semantic_classes (internally computes transitions)
-        # LEVIR-MCI uses MultiClassChangeMetrics with direct num_classes
-        if self.is_levir:
-            if self.is_binary:
-                self.cd_metrics = BinaryChangeMetrics()
-            else:
-                self.cd_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
+        # Both datasets now use MultiClassChangeMetrics since we predict semantic classes
+        # SECOND-CC: 7 semantic classes (what the area became)
+        # LEVIR-MCI: 2-3 change classes
+        if self.is_levir and self.is_binary:
+            self.cd_metrics = BinaryChangeMetrics()
         else:
-            # SemanticChangeMetrics takes semantic classes and computes transitions internally
-            self.cd_metrics = SemanticChangeMetrics(config['dataset']['num_classes'])
+            self.cd_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
         
         self.caption_metrics = CaptionMetrics()
     
@@ -144,11 +141,13 @@ class Evaluator:
             rgb_b = batch['rgb_b'].to(self.device)
             raw_captions = batch['raw_captions']
             
-            # Get targets
+            # Get targets - unified approach
+            # SECOND-CC: use sem_b (what the area became after change)
+            # LEVIR-MCI: use label (change mask)
             if self.is_levir:
                 targets = batch['label']
             else:
-                targets = batch['change_map']
+                targets = batch['sem_b']
             
             # Forward pass
             outputs = self.model(rgb_a, rgb_b)
@@ -161,12 +160,10 @@ class Evaluator:
             self.cd_metrics.update(cd_preds.cpu(), targets)
             
             # Generate captions
-            caption_logits = outputs.get('caption_logits')
-            if caption_logits is not None:
-                caption_preds = caption_logits.argmax(dim=-1)
-                
-                for i in range(caption_preds.shape[0]):
-                    pred_caption = self.vocab.decode(caption_preds[i]) if self.vocab else ""
+            generated_captions = outputs.get('generated_captions')
+            if generated_captions is not None:
+                for i in range(generated_captions.shape[0]):
+                    pred_caption = self.vocab.decode(generated_captions[i]) if self.vocab else ""
                     all_predictions.append(pred_caption)
                     all_references.append(raw_captions[i])
         
