@@ -3,8 +3,8 @@
 UniSCC Training Script - Shared Semantic Space Architecture
 
 Unified training for:
-- SECOND-CC: Semantic Change Detection (7+7 classes) + Captioning
-- LEVIR-MCI: Multi-class Change Detection (3 classes) + Captioning
+- SECOND-CC: Semantic Change Detection (7 after-change classes) + Captioning
+- LEVIR-MCI: Semantic Change Detection (3 classes) + Captioning
 
 Usage:
     python train.py --config configs/second_cc.yaml
@@ -115,9 +115,9 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Architecture: Shared Semantic Space")
         if self.is_levir:
-            print(f"Task: {self.num_classes}-class Change Detection + Captioning")
+            print(f"Task: {self.num_classes}-class Semantic Change Detection + Captioning")
         else:
-            print(f"Task: Dual Semantic Prediction ({self.num_classes}+{self.num_classes} classes) + Captioning")
+            print(f"Task: {self.num_classes}-class After-Change Semantic Detection + Captioning")
         print(f"{'='*60}\n")
 
         # Setup components
