@@ -16,14 +16,14 @@ dataset:
   num_channels: 3
   spatial_resolution: 0.5  # meters per pixel
 
-  # Multi-class change detection (3 classes)
-  # Note: Unlike SECOND-CC, LEVIR-MCI has a single change mask (not bitemporal semantic maps)
-  # The label directly indicates the type of change at each pixel
+  # 3-class semantic change detection
+  # Uses label_rgb for after-change semantics (what the area became after change)
+  # Color mapping: (0,0,0) -> no_change, (255,0,0) -> building, (0,0,255) -> road
   num_classes: 3
   class_names:
-    - "no_change"   # 0: no change detected
-    - "building"    # 1: building change
-    - "road"        # 2: road change
+    - "no_change"   # 0: no change detected (black)
+    - "building"    # 1: building (red)
+    - "road"        # 2: road (blue)
   
   # Caption settings
   max_caption_length: 50

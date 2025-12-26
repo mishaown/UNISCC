@@ -35,6 +35,14 @@ class LEVIRMCIDataset(Dataset):
     
     NUM_CLASSES = 3  # No Change, Building, Road
     CLASS_NAMES = ['no_change', 'building', 'road']
+
+    # RGB color mapping for label_rgb semantic masks
+    # Format: (R, G, B) -> class_id
+    COLOR_MAP = {
+        (0, 0, 0): 0,       # background/no_change
+        (255, 0, 0): 1,     # building (red)
+        (0, 0, 255): 2,     # road (blue)
+    }
     
     def __init__(
         self,
@@ -95,28 +103,43 @@ class LEVIRMCIDataset(Dataset):
         rgb_a = Image.open(self.root / "images" / split_dir / "A" / filename).convert('RGB')
         rgb_b = Image.open(self.root / "images" / split_dir / "B" / filename).convert('RGB')
         
-        # Load binary change mask
-        label_path = self.root / "images" / split_dir / "label" / filename
-        if label_path.exists():
-            label = Image.open(label_path)
+        # Load semantic label from label_rgb (after-change semantics)
+        label_rgb_path = self.root / "images" / split_dir / "label_rgb" / filename
+        if label_rgb_path.exists():
+            label_rgb = Image.open(label_rgb_path).convert('RGB')
         else:
-            label = Image.fromarray(np.zeros((256, 256), dtype=np.uint8))
-        
-        # Apply transforms
-        rgb_a_t, rgb_b_t, label_t = self.transform(rgb_a, rgb_b, label)
-        
-        # Keep multi-class labels (0/1/2). Map RGB masks if needed.
-        if label_t is not None:
-            if label_t.dim() == 3 and label_t.shape[-1] == 3:
-                r = label_t[..., 0]
-                g = label_t[..., 1]
-                b = label_t[..., 2]
-                out = torch.zeros(label_t.shape[0], label_t.shape[1], dtype=torch.long)
-                out[(r == 255) & (g == 0) & (b == 0)] = 1  # Building
-                out[(r == 255) & (g == 255) & (b == 0)] = 2  # Road
-                label_t = out
+            # Fallback to regular label if label_rgb doesn't exist
+            label_path = self.root / "images" / split_dir / "label" / filename
+            if label_path.exists():
+                label = Image.open(label_path)
+                label_rgb = None
             else:
-                label_t = label_t.long()
+                label = Image.fromarray(np.zeros((256, 256), dtype=np.uint8))
+                label_rgb = None
+
+        # Apply transforms to RGB images only
+        rgb_a_t, rgb_b_t, _ = self.transform(rgb_a, rgb_b, None)
+
+        # Convert label_rgb to class indices
+        if label_rgb is not None:
+            # Resize label_rgb to match image size
+            label_rgb = label_rgb.resize((256, 256), Image.NEAREST)
+            label_array = np.array(label_rgb)
+
+            # Map RGB colors to class IDs
+            label_t = np.zeros((256, 256), dtype=np.int64)
+            for color, class_id in self.COLOR_MAP.items():
+                mask = (label_array[:, :, 0] == color[0]) & \
+                       (label_array[:, :, 1] == color[1]) & \
+                       (label_array[:, :, 2] == color[2])
+                label_t[mask] = class_id
+            label_t = torch.from_numpy(label_t).long()
+        else:
+            # Fallback: use binary label
+            label = label.resize((256, 256), Image.NEAREST)
+            label_t = torch.from_numpy(np.array(label)).long()
+            # Ensure binary values
+            label_t = (label_t > 0).long()
         
         # Process captions
         sentences = sample.get('sentences', [])

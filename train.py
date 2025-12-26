@@ -29,7 +29,7 @@ from tqdm import tqdm
 from data import create_dataloaders
 from src import UniSCC, UniSCCConfig, build_uniscc
 from losses import CaptionLoss
-from utils import BinaryChangeMetrics, SemanticChangeMetrics, MultiClassChangeMetrics, CaptionMetrics
+from utils import MultiClassChangeMetrics, CaptionMetrics
 
 
 def set_seed(seed: int):

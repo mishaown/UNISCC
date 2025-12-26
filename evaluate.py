@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from data import create_dataloaders
 from src import UniSCC, UniSCCConfig, build_uniscc
-from utils import BinaryChangeMetrics, SemanticChangeMetrics, MultiClassChangeMetrics, CaptionMetrics
+from utils import MultiClassChangeMetrics, CaptionMetrics
 
 
 def load_config(config_path: str) -> dict:
@@ -51,7 +51,6 @@ class Evaluator:
         # Dataset type
         self.dataset_name = config['dataset']['name']
         self.is_levir = self.dataset_name == 'LEVIR-MCI'
-        self.is_binary = config['dataset']['num_classes'] == 2
         
         print(f"\n{'='*60}")
         print(f"UniSCC Evaluation - {self.dataset_name}")
@@ -65,13 +64,10 @@ class Evaluator:
         self._load_model(checkpoint_path)
         
         # Initialize metrics
-        # Both datasets now use MultiClassChangeMetrics since we predict semantic classes
-        # SECOND-CC: 7 semantic classes (what the area became)
-        # LEVIR-MCI: 2-3 change classes
-        if self.is_levir and self.is_binary:
-            self.cd_metrics = BinaryChangeMetrics()
-        else:
-            self.cd_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
+        # Both datasets use MultiClassChangeMetrics since we predict semantic classes
+        # SECOND-CC: 7 semantic classes (after-change: what the area became)
+        # LEVIR-MCI: 3 semantic classes (no_change, building, road)
+        self.cd_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
         
         self.caption_metrics = CaptionMetrics()
     
@@ -108,8 +104,10 @@ class Evaluator:
             backbone=model_cfg.get('encoder', {}).get('backbone', 'swin_base_patch4_window7_224'),
             feature_dim=model_cfg.get('tdt', {}).get('hidden_dim', 512),
             vocab_size=self.config['dataset'].get('vocab_size', 10000),
-            scd_classes=dataset_num_classes if not self.is_levir else 7,
-            bcd_classes=dataset_num_classes if self.is_levir else 2,
+            # SECOND-CC: 7 after-change semantic classes
+            # LEVIR-MCI: 3 semantic classes (no_change, building, road)
+            scd_classes=7 if not self.is_levir else 7,
+            bcd_classes=3 if self.is_levir else 3,
             max_caption_length=self.config['dataset'].get('max_caption_length', 50)
         )
         self.model = UniSCC(config).to(self.device)
@@ -187,13 +185,13 @@ class Evaluator:
         print("\n" + "=" * 60)
         print(f"EVALUATION RESULTS - {self.dataset_name}")
         print("=" * 60)
-        
+
         # CD metrics
         if self.is_levir:
-            metric_name = "Binary Change Detection" if self.is_binary else "Multi-class Change Detection"
+            metric_name = "Semantic Change Detection (3-class: no_change, building, road)"
         else:
-            metric_name = "Semantic Change Detection"
-        print(f"\n📊 {metric_name} Metrics:")
+            metric_name = "Semantic Change Detection (7-class after-change semantics)"
+        print(f"\n{metric_name} Metrics:")
         print("-" * 40)
         for metric, value in results['cd'].items():
             print(f"  {metric:15s}: {value:.4f}")

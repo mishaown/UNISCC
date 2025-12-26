@@ -15,12 +15,9 @@ dataset:
   image_size: 256
   num_channels: 3
 
-  # 7 semantic classes for SCD
-  # Note: The model outputs 49 transition classes (7x7) for change detection
-  # Transition encoding: change_class = sem_a * 7 + sem_b
-  # Where sem_a is the class in image A and sem_b is the class in image B
+  # 7 after-change semantic classes for SCD
+  # The model outputs 7 classes representing what the area became after change (sem_b)
   num_classes: 7
-  num_transition_classes: 49  # 7x7, computed automatically by the model
   class_names:
     - "background"        # 0: unchanged background/no_change
     - "low_vegetation"    # 1
