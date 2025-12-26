@@ -41,7 +41,7 @@ SECOND_CC_COLORS = {
 }
 SECOND_CC_NAMES = ['No Change', 'Low Vegetation', 'Ground', 'Tree', 'Water', 'Building', 'Playground']
 
-LEVIR_MCI_COLORS = {0: (0, 0, 0), 1: (255, 0, 0), 2: (255, 255, 0)}
+LEVIR_MCI_COLORS = {0: (0, 0, 0), 1: (255, 0, 0), 2: (0, 0, 255)}
 LEVIR_MCI_NAMES = ['No Change', 'Building', 'Road']
 
 
@@ -62,7 +62,6 @@ class Inferencer:
         # Dataset info
         self.dataset_name = config['dataset']['name']
         self.is_levir = self.dataset_name == 'LEVIR-MCI'
-        self.is_binary = config['dataset']['num_classes'] == 2
         self.num_classes = config['dataset']['num_classes']
         self.image_size = config['dataset']['image_size']
         
@@ -108,17 +107,18 @@ class Inferencer:
         """Load model from checkpoint."""
         # Determine dataset type
         dataset_type = 'levir_mci' if self.is_levir else 'second_cc'
-        
+
         # Build model using config
         model_cfg = self.config.get('model', {})
-        dataset_num_classes = self.config['dataset']['num_classes']
         config = UniSCCConfig(
             dataset=dataset_type,
             backbone=model_cfg.get('encoder', {}).get('backbone', 'swin_base_patch4_window7_224'),
             feature_dim=model_cfg.get('tdt', {}).get('hidden_dim', 512),
             vocab_size=len(self.vocab),
-            scd_classes=dataset_num_classes if not self.is_levir else 7,
-            bcd_classes=dataset_num_classes if self.is_levir else 2,
+            # SECOND-CC: 7 after-change semantic classes
+            # LEVIR-MCI: 3 semantic classes (no_change, building, road)
+            num_semantic_classes=7,
+            num_change_classes=3,
             max_caption_length=self.config['dataset'].get('max_caption_length', 50)
         )
         self.model = UniSCC(config).to(self.device)
@@ -163,19 +163,18 @@ class Inferencer:
         }
     
     def colorize_map(self, change_map: np.ndarray) -> np.ndarray:
-        """Convert change map to RGB."""
+        """Convert change map to RGB.
+
+        Both datasets now output semantic class predictions directly:
+        - SECOND-CC: 7 after-change semantic classes
+        - LEVIR-MCI: 3 semantic classes (no_change, building, road)
+        """
         H, W = change_map.shape
         rgb = np.zeros((H, W, 3), dtype=np.uint8)
-        
-        if self.is_levir:
-            for class_id, color in self.colors.items():
-                rgb[change_map == class_id] = color
-        else:
-            # For semantic, decode transition
-            to_class = change_map % self.num_classes
-            for class_id, color in self.colors.items():
-                rgb[to_class == class_id] = color
-        
+
+        for class_id, color in self.colors.items():
+            rgb[change_map == class_id] = color
+
         return rgb
     
     def visualize(
