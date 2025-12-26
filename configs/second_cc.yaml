@@ -93,7 +93,7 @@ loss:
 # Training Configuration
 # =============================================================================
 training:
-  batch_size: 4
+  batch_size: 12
   num_epochs: 10
   num_workers: 8
   
@@ -138,10 +138,11 @@ augmentation:
 # Evaluation
 # =============================================================================
 evaluation:
-  batch_size: 16
+  batch_size: 12
   beam_size: 5
-  
-  scd_metrics: ["SeK", "mIoU", "F1", "OA"]
+
+  # Semantic CD metrics (7 after-change classes)
+  cd_metrics: ["mIoU", "F1", "OA"]
   caption_metrics: ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"]
 
 # =============================================================================
