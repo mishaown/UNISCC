@@ -2,6 +2,13 @@
 
 A unified framework for joint Semantic Change Detection (SCD) and Change Captioning (CC) on remote sensing imagery.
 
+## v3.0 Features
+
+- **Dual Semantic Head**: Predicts both before-change (sem_A) and after-change (sem_B) semantic maps
+- **Transition-aware Captioning**: Uses transition embeddings from semantic changes for better caption generation
+- **Derived Change Mask**: Automatically computes binary change mask where sem_A != sem_B
+- **Focal Loss**: Handles class imbalance with configurable focal loss
+
 ## Supported Datasets
 
 ### SECOND-CC (Semantic Change Detection + Change Captioning)
@@ -32,17 +39,19 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### Basic Usage
+### Basic Usage (v3.0)
 
 ```python
 from src.uniscc import UniSCC, UniSCCConfig
 import torch
 
-# Create model for SECOND-CC dataset (7 after-change semantic classes)
+# Create model for SECOND-CC dataset with v3.0 dual semantic head
 config = UniSCCConfig(
     dataset='second_cc',
     vocab_size=10000,
-    pretrained=True
+    pretrained=True,
+    dual_head=True,                # v3.0: Enable dual semantic head
+    use_transition_attention=True  # v3.0: Transition-aware captioning
 )
 model = UniSCC(config)
 
@@ -55,8 +64,15 @@ lengths = torch.tensor([30, 25])
 # Training forward pass
 model.train()
 outputs = model(img_t0, img_t1, captions, lengths)
-cd_logits = outputs['cd_logits']        # [B, 7, 256, 256] - 7 after-change classes
-caption_logits = outputs['caption_logits']  # [B, 50, 10000]
+
+# v3.0 outputs
+sem_A_logits = outputs['sem_A_logits']    # [B, 7, 256, 256] before-change
+sem_B_logits = outputs['sem_B_logits']    # [B, 7, 256, 256] after-change
+change_mask = outputs['change_mask']       # [B, 256, 256] derived mask
+caption_logits = outputs['caption_logits'] # [B, 50, 10000]
+
+# Backward compatible
+cd_logits = outputs['cd_logits']  # Same as sem_B_logits
 
 # Inference (caption generation)
 model.eval()
@@ -65,9 +81,9 @@ with torch.no_grad():
     generated = outputs['generated_captions']  # [B, T]
 
 # For LEVIR-MCI (3 semantic classes)
-config_levir = UniSCCConfig(dataset='levir_mci', vocab_size=10000)
+config_levir = UniSCCConfig(dataset='levir_mci', vocab_size=10000, dual_head=True)
 model_levir = UniSCC(config_levir)
-# cd_logits shape: [B, 3, 256, 256] - no_change, building, road
+# sem_A/sem_B shape: [B, 3, 256, 256] - no_change, building, road
 ```
 
 ### Run Sanity Checks
@@ -85,11 +101,11 @@ UniSCC/
 │   └── levir_mci.yaml          # LEVIR-MCI configuration
 ├── src/
 │   ├── encoder.py              # Vision encoder with temporal embeddings
-│   ├── tdt.py                  # Temporal Difference Transformer
-│   ├── lsp.py                  # Learnable Semantic Prompts
-│   ├── change_head.py          # Unified Change Detection Head
-│   ├── caption_decoder.py      # Change-Guided Caption Decoder
-│   ├── uniscc.py               # Main model integration
+│   ├── tdt.py                  # Temporal Difference Transformer (v3: returns enhanced features)
+│   ├── lsp.py                  # Learnable Semantic Prompts + TransitionLSP (v3)
+│   ├── semantic_head.py        # DualSemanticHead (v3) + SemanticChangeHead
+│   ├── caption_decoder.py      # TransitionCaptionDecoder (v3) + SemanticCaptionDecoder
+│   ├── uniscc.py               # Main model integration (v3.0)
 │   └── sanity_check.py         # Comprehensive test suite
 ├── losses/
 │   ├── scd_loss.py             # Change detection losses
@@ -102,9 +118,9 @@ UniSCC/
 │   └── transforms.py           # Data augmentations
 ├── utils/
 │   └── metrics.py              # Evaluation metrics
-├── train.py                    # Training script
-├── evaluate.py                 # Evaluation script
-├── inference.py                # Inference script
+├── train.py                    # Training script (v3.0)
+├── evaluate.py                 # Evaluation script (v3.0)
+├── inference.py                # Inference script (v3.0)
 ├── requirements.txt
 └── README.md
 ```
@@ -170,15 +186,15 @@ python inference.py --config configs/levir_mci.yaml \
 
 ## Model Architecture
 
-### Components
+### Components (v3.0)
 
 1. **Encoder**: Siamese Swin Transformer with learnable temporal embeddings
-2. **TDT (Temporal Difference Transformer)**: Bidirectional cross-temporal attention for capturing "what appeared" and "what disappeared"
-3. **LSP (Learnable Semantic Prompts)**: CLIP-initialized prompts with learnable offsets
-4. **Change Head**: Progressive upsampling decoder for change detection
-5. **Caption Decoder**: Transformer decoder with change-guided attention
+2. **TDT (Temporal Difference Transformer)**: Returns diff + enhanced features for both timestamps
+3. **TransitionLSP**: Dual semantic prompts (A/B) + transition embeddings for "what changed into what"
+4. **DualSemanticHead**: Predicts both sem_A (before) and sem_B (after) semantic maps
+5. **TransitionCaptionDecoder**: Transformer decoder with transition-aware attention
 
-### Data Flow
+### Data Flow (v3.0)
 ```
 img_t0, img_t1 [B,3,H,W]
     │
@@ -192,10 +208,20 @@ feat_t0, feat_t1 [B,C,H',W']
 TDT [bidirectional attention]
     │
     ▼
-diff_features [B,C,H',W']
+{diff, feat_t0_enhanced, feat_t1_enhanced}
     │
-    ├──► Change Head → cd_logits [B,K,H,W]  (K=7 for SECOND-CC, K=3 for LEVIR-MCI)
-    └──► Caption Decoder → caption_logits [B,T,V]
+    ▼
+TransitionLSP → prompts_A, prompts_B, transitions
+    │
+    ▼
+DualSemanticHead
+    ├──► sem_A_logits [B,K,H,W]  (before-change semantics)
+    ├──► sem_B_logits [B,K,H,W]  (after-change semantics)
+    └──► change_mask [B,H,W]     (derived: sem_A != sem_B)
+    │
+    ▼
+TransitionCaptionDecoder
+    └──► caption_logits [B,T,V]
 ```
 
 ## Configuration
@@ -216,22 +242,35 @@ config = UniSCCConfig(
     tdt_layers=3,
     tdt_heads=8,
 
-    # Change Detection (after-change semantics)
-    num_semantic_classes=7,       # SECOND-CC: 7 after-change classes
+    # Change Detection
+    num_semantic_classes=7,       # SECOND-CC: 7 semantic classes
     num_change_classes=3,         # LEVIR-MCI: 3 semantic classes
 
     # Caption Decoder
     vocab_size=10000,
     decoder_layers=6,
     max_caption_length=50,
+
+    # v3.0: Dual Head Configuration
+    dual_head=True,               # Enable dual semantic head
+    share_decoder=True,           # Share decoder weights between A and B
+    use_transition_attention=True,# Transition-aware captioning
+
+    # v3.0: Loss Configuration
+    use_focal_loss=True,          # Use focal loss for class imbalance
+    focal_gamma=2.0,              # Focal loss gamma
+    sem_A_weight=1.0,             # Weight for before-change loss
+    sem_B_weight=1.0,             # Weight for after-change loss
 )
 ```
 
 ## Metrics
 
-### Change Detection
-- **SECOND-CC (7-class semantic)**: mIoU, F1, OA
-- **LEVIR-MCI (3-class semantic)**: mIoU, F1, OA
+### Change Detection (v3.0)
+- **Before-change (sem_A)**: mIoU, F1, OA for before-change semantic prediction
+- **After-change (sem_B)**: mIoU, F1, OA for after-change semantic prediction (primary metric)
+- **SECOND-CC**: 7-class semantic evaluation
+- **LEVIR-MCI**: 3-class semantic evaluation
 
 ### Change Captioning
 - BLEU-1/2/3/4, METEOR, ROUGE-L, CIDEr

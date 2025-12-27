@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """
-UniSCC Inference Script
+UniSCC Inference Script (v3.0)
 
-Run inference on single image pairs or directories.
+Run inference on single image pairs or directories with dual semantic output.
+
+v3.0 Features:
+- Predicts both before-change (sem_A) and after-change (sem_B) semantic maps
+- Derives change mask from semantic predictions
+- Uses transition-aware caption decoder
+
+Outputs:
+- sem_A.npy: Before-change semantic map
+- sem_B.npy: After-change semantic map
+- change_map.npy: Same as sem_B (backward compat)
+- change_mask.npy: Binary change mask (where sem_A != sem_B)
+- caption.txt: Generated change caption
+- viz.png: Visualization with all outputs
 
 Usage:
     python inference.py --config configs/levir_mci.yaml \\
@@ -104,62 +117,86 @@ class Inferencer:
             self.vocab.build_vocab([[w] for w in common_words])
     
     def _load_model(self, checkpoint_path: str):
-        """Load model from checkpoint."""
+        """Load model from checkpoint with v3.0 configuration."""
         # Determine dataset type
         dataset_type = 'levir_mci' if self.is_levir else 'second_cc'
 
-        # Build model using config
+        # Build model using v3.0 config with dual semantic head
         model_cfg = self.config.get('model', {})
         config = UniSCCConfig(
             dataset=dataset_type,
             backbone=model_cfg.get('encoder', {}).get('backbone', 'swin_base_patch4_window7_224'),
             feature_dim=model_cfg.get('tdt', {}).get('hidden_dim', 512),
             vocab_size=len(self.vocab),
-            # SECOND-CC: 7 after-change semantic classes
-            # LEVIR-MCI: 3 semantic classes (no_change, building, road)
-            num_semantic_classes=7,
-            num_change_classes=3,
-            max_caption_length=self.config['dataset'].get('max_caption_length', 50)
+            # v3.0: Semantic class configuration
+            num_semantic_classes=7,  # SECOND-CC semantic classes
+            num_change_classes=3,    # LEVIR-MCI change classes
+            max_caption_length=self.config['dataset'].get('max_caption_length', 50),
+            # v3.0: Enable dual head with transition prompts
+            dual_head=True,
+            use_transition_attention=True
         )
         self.model = UniSCC(config).to(self.device)
-        
+
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded checkpoint: {checkpoint_path}")
         else:
             print(f"Warning: Checkpoint not found, using random weights")
-        
+
         self.model.eval()
     
     @torch.no_grad()
     def predict(self, image_a: Image.Image, image_b: Image.Image) -> Dict[str, Any]:
-        """Run inference on image pair."""
+        """Run inference on image pair with v3.0 dual semantic output."""
         # Transform images
         rgb_a, rgb_b, _ = self.transform(image_a, image_b, None)
         rgb_a = rgb_a.unsqueeze(0).to(self.device)
         rgb_b = rgb_b.unsqueeze(0).to(self.device)
-        
+
         # Forward pass
         outputs = self.model(rgb_a, rgb_b)
-        
-        # CD predictions
-        cd_logits = outputs['cd_logits']
-        cd_probs = F.softmax(cd_logits, dim=1)
-        cd_pred = cd_logits.argmax(dim=1).squeeze(0).cpu().numpy()
-        
-        # Caption
-        caption_logits = outputs.get('caption_logits')
-        if caption_logits is not None:
-            caption_tokens = caption_logits.argmax(dim=-1).squeeze(0)
-            caption = self.vocab.decode(caption_tokens)
+
+        # v3.0: Get both before and after semantic predictions
+        sem_A_logits = outputs.get('sem_A_logits')
+        sem_B_logits = outputs.get('sem_B_logits', outputs['cd_logits'])
+
+        # After-change predictions (primary output)
+        sem_B_probs = F.softmax(sem_B_logits, dim=1)
+        sem_B_pred = sem_B_logits.argmax(dim=1).squeeze(0).cpu().numpy()
+
+        # Before-change predictions (v3.0)
+        sem_A_pred = None
+        if sem_A_logits is not None:
+            sem_A_pred = sem_A_logits.argmax(dim=1).squeeze(0).cpu().numpy()
+
+        # v3.0: Get derived change mask
+        change_mask = outputs.get('change_mask')
+        if change_mask is not None:
+            change_mask = change_mask.squeeze(0).cpu().numpy()
+
+        # Caption from generated tokens
+        generated_captions = outputs.get('generated_captions')
+        if generated_captions is not None:
+            caption = self.vocab.decode(generated_captions[0])
         else:
-            caption = "No caption generated"
-        
+            # Fallback to caption_logits if available
+            caption_logits = outputs.get('caption_logits')
+            if caption_logits is not None:
+                caption_tokens = caption_logits.argmax(dim=-1).squeeze(0)
+                caption = self.vocab.decode(caption_tokens)
+            else:
+                caption = "No caption generated"
+
         return {
-            'change_map': cd_pred,
-            'change_probs': cd_probs.squeeze(0).cpu().numpy(),
-            'caption': caption
+            'change_map': sem_B_pred,  # After-change semantic map (primary)
+            'change_probs': sem_B_probs.squeeze(0).cpu().numpy(),
+            'caption': caption,
+            # v3.0 additions
+            'sem_A_map': sem_A_pred,   # Before-change semantic map
+            'sem_B_map': sem_B_pred,   # After-change semantic map
+            'change_mask': change_mask  # Derived binary change mask
         }
     
     def colorize_map(self, change_map: np.ndarray) -> np.ndarray:
@@ -184,44 +221,90 @@ class Inferencer:
         results: Dict[str, Any],
         save_path: Optional[str] = None
     ) -> plt.Figure:
-        """Create visualization."""
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-        
-        # Before
-        axes[0].imshow(image_a.resize((self.image_size, self.image_size)))
-        axes[0].set_title('Before', fontsize=12, fontweight='bold')
-        axes[0].axis('off')
-        
-        # After
-        axes[1].imshow(image_b.resize((self.image_size, self.image_size)))
-        axes[1].set_title('After', fontsize=12, fontweight='bold')
-        axes[1].axis('off')
-        
-        # Change map
-        change_rgb = self.colorize_map(results['change_map'])
-        axes[2].imshow(change_rgb)
-        axes[2].set_title('Change Map', fontsize=12, fontweight='bold')
-        axes[2].axis('off')
-        
-        # Add legend
-        patches = [mpatches.Patch(color=np.array(c)/255, label=n) 
-                   for n, c in zip(self.class_names, self.colors.values())]
-        axes[2].legend(handles=patches, loc='upper right', fontsize=8)
-        
-        # Caption
-        axes[3].text(0.5, 0.5, f'"{results["caption"]}"',
-                    ha='center', va='center', fontsize=12, wrap=True,
-                    transform=axes[3].transAxes,
-                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-        axes[3].set_title('Generated Caption', fontsize=12, fontweight='bold')
-        axes[3].axis('off')
-        
+        """Create v3.0 visualization with before/after semantics."""
+        # Determine layout based on available outputs
+        has_dual = results.get('sem_A_map') is not None
+        has_change_mask = results.get('change_mask') is not None
+
+        if has_dual:
+            # v3.0: Show before semantic, after semantic, and change mask
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            axes = axes.flatten()
+
+            # Row 1: Images
+            axes[0].imshow(image_a.resize((self.image_size, self.image_size)))
+            axes[0].set_title('Before Image', fontsize=12, fontweight='bold')
+            axes[0].axis('off')
+
+            axes[1].imshow(image_b.resize((self.image_size, self.image_size)))
+            axes[1].set_title('After Image', fontsize=12, fontweight='bold')
+            axes[1].axis('off')
+
+            # Change mask (if available)
+            if has_change_mask:
+                axes[2].imshow(results['change_mask'], cmap='gray')
+                axes[2].set_title('Change Mask', fontsize=12, fontweight='bold')
+            else:
+                axes[2].axis('off')
+            axes[2].axis('off')
+
+            # Row 2: Semantic maps and caption
+            sem_A_rgb = self.colorize_map(results['sem_A_map'])
+            axes[3].imshow(sem_A_rgb)
+            axes[3].set_title('Before Semantics', fontsize=12, fontweight='bold')
+            axes[3].axis('off')
+
+            sem_B_rgb = self.colorize_map(results['sem_B_map'])
+            axes[4].imshow(sem_B_rgb)
+            axes[4].set_title('After Semantics', fontsize=12, fontweight='bold')
+            axes[4].axis('off')
+
+            # Caption
+            axes[5].text(0.5, 0.5, f'"{results["caption"]}"',
+                        ha='center', va='center', fontsize=11, wrap=True,
+                        transform=axes[5].transAxes,
+                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            axes[5].set_title('Generated Caption', fontsize=12, fontweight='bold')
+            axes[5].axis('off')
+
+            # Add legend to semantic maps
+            patches = [mpatches.Patch(color=np.array(c)/255, label=n)
+                       for n, c in zip(self.class_names, self.colors.values())]
+            fig.legend(handles=patches, loc='lower center', ncol=len(patches), fontsize=9)
+        else:
+            # Legacy layout
+            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+
+            axes[0].imshow(image_a.resize((self.image_size, self.image_size)))
+            axes[0].set_title('Before', fontsize=12, fontweight='bold')
+            axes[0].axis('off')
+
+            axes[1].imshow(image_b.resize((self.image_size, self.image_size)))
+            axes[1].set_title('After', fontsize=12, fontweight='bold')
+            axes[1].axis('off')
+
+            change_rgb = self.colorize_map(results['change_map'])
+            axes[2].imshow(change_rgb)
+            axes[2].set_title('Change Map', fontsize=12, fontweight='bold')
+            axes[2].axis('off')
+
+            patches = [mpatches.Patch(color=np.array(c)/255, label=n)
+                       for n, c in zip(self.class_names, self.colors.values())]
+            axes[2].legend(handles=patches, loc='upper right', fontsize=8)
+
+            axes[3].text(0.5, 0.5, f'"{results["caption"]}"',
+                        ha='center', va='center', fontsize=12, wrap=True,
+                        transform=axes[3].transAxes,
+                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            axes[3].set_title('Generated Caption', fontsize=12, fontweight='bold')
+            axes[3].axis('off')
+
         plt.tight_layout()
-        
+
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
             print(f"Saved: {save_path}")
-        
+
         return fig
     
     def process_pair(
@@ -231,32 +314,41 @@ class Inferencer:
         output_dir: str,
         output_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Process a single image pair."""
+        """Process a single image pair with v3.0 outputs."""
         # Load images
         image_a = Image.open(image_a_path).convert('RGB')
         image_b = Image.open(image_b_path).convert('RGB')
-        
+
         # Predict
         results = self.predict(image_a, image_b)
-        
+
         # Output name
         if output_name is None:
             output_name = Path(image_a_path).stem
-        
+
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save change map
+
+        # v3.0: Save both semantic maps
+        if results.get('sem_A_map') is not None:
+            np.save(output_dir / f'{output_name}_sem_A.npy', results['sem_A_map'])
+        if results.get('sem_B_map') is not None:
+            np.save(output_dir / f'{output_name}_sem_B.npy', results['sem_B_map'])
+        # Backward compat: save change_map (same as sem_B)
         np.save(output_dir / f'{output_name}_change_map.npy', results['change_map'])
-        
+
+        # v3.0: Save change mask if available
+        if results.get('change_mask') is not None:
+            np.save(output_dir / f'{output_name}_change_mask.npy', results['change_mask'])
+
         # Save caption
         with open(output_dir / f'{output_name}_caption.txt', 'w') as f:
             f.write(results['caption'])
-        
+
         # Save visualization
-        self.visualize(image_a, image_b, results, 
+        self.visualize(image_a, image_b, results,
                       save_path=str(output_dir / f'{output_name}_viz.png'))
-        
+
         return results
     
     def process_directory(
@@ -317,8 +409,13 @@ def main():
         inferencer.process_directory(args.input_dir, args.output_dir)
     else:
         results = inferencer.process_pair(args.image_a, args.image_b, args.output_dir)
-        print(f"\nCaption: {results['caption']}")
-        print(f"Change map shape: {results['change_map'].shape}")
+        print(f"\n=== v3.0 Results ===")
+        print(f"Caption: {results['caption']}")
+        print(f"After-change map shape: {results['change_map'].shape}")
+        if results.get('sem_A_map') is not None:
+            print(f"Before-change map shape: {results['sem_A_map'].shape}")
+        if results.get('change_mask') is not None:
+            print(f"Change mask shape: {results['change_mask'].shape}")
 
 
 if __name__ == '__main__':

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-UniSCC Evaluation Script
+UniSCC Evaluation Script (v3.0)
 
-Evaluates trained models on:
+Evaluates trained models with dual semantic head support.
+
+v3.0 Features:
+- Evaluates both before-change (sem_A) and after-change (sem_B) predictions
+- Uses focal loss compatible metrics
+- Supports transition-aware caption evaluation
+
+Metrics:
 - SECOND-CC: SeK, mIoU, F1, OA + BLEU, METEOR, ROUGE-L, CIDEr
 - LEVIR-MCI: Precision, Recall, F1, IoU, OA, Kappa + BLEU, METEOR, ROUGE-L, CIDEr
 
@@ -64,11 +71,14 @@ class Evaluator:
         self._load_model(checkpoint_path)
         
         # Initialize metrics
-        # Both datasets use MultiClassChangeMetrics since we predict semantic classes
-        # SECOND-CC: 7 semantic classes (after-change: what the area became)
+        # v3.0: Evaluate both sem_A (before) and sem_B (after) predictions
+        # SECOND-CC: 7 semantic classes
         # LEVIR-MCI: 3 semantic classes (no_change, building, road)
-        self.cd_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
-        
+        self.sem_A_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
+        self.sem_B_metrics = MultiClassChangeMetrics(config['dataset']['num_classes'])
+        # Backward compat alias
+        self.cd_metrics = self.sem_B_metrics
+
         self.caption_metrics = CaptionMetrics()
     
     def _setup_data(self):
@@ -95,20 +105,23 @@ class Evaluator:
         
         # Determine dataset type
         dataset_type = 'levir_mci' if self.is_levir else 'second_cc'
-        
+
         # Build model using config
         model_cfg = self.config.get('model', {})
-        dataset_num_classes = self.config['dataset']['num_classes']
+
+        # v3.0 config with dual semantic head
         config = UniSCCConfig(
             dataset=dataset_type,
             backbone=model_cfg.get('encoder', {}).get('backbone', 'swin_base_patch4_window7_224'),
             feature_dim=model_cfg.get('tdt', {}).get('hidden_dim', 512),
             vocab_size=self.config['dataset'].get('vocab_size', 10000),
-            # SECOND-CC: 7 after-change semantic classes
-            # LEVIR-MCI: 3 semantic classes (no_change, building, road)
-            scd_classes=7 if not self.is_levir else 7,
-            bcd_classes=3 if self.is_levir else 3,
-            max_caption_length=self.config['dataset'].get('max_caption_length', 50)
+            # v3.0: Use num_semantic_classes and num_change_classes
+            num_semantic_classes=7,  # SECOND-CC semantic classes
+            num_change_classes=3,    # LEVIR-MCI change classes
+            max_caption_length=self.config['dataset'].get('max_caption_length', 50),
+            # v3.0: Enable dual head with transition prompts
+            dual_head=True,
+            use_transition_attention=True
         )
         self.model = UniSCC(config).to(self.device)
         
@@ -124,39 +137,48 @@ class Evaluator:
     
     @torch.no_grad()
     def evaluate(self) -> Dict[str, Any]:
-        """Run evaluation."""
+        """Run evaluation with v3.0 dual semantic head support."""
         print(f"\nEvaluating on {self.split} set...")
-        
+
         # Reset metrics
-        self.cd_metrics.reset()
+        self.sem_A_metrics.reset()
+        self.sem_B_metrics.reset()
         self.caption_metrics.reset()
-        
+
         all_predictions = []
         all_references = []
-        
+
         for batch in tqdm(self.dataloader, desc="Evaluating"):
             rgb_a = batch['rgb_a'].to(self.device)
             rgb_b = batch['rgb_b'].to(self.device)
             raw_captions = batch['raw_captions']
-            
-            # Get targets - unified approach
-            # SECOND-CC: use sem_b (what the area became after change)
-            # LEVIR-MCI: use label (change mask)
+
+            # v3.0: Get targets for both before and after
+            # SECOND-CC: sem_a (before), sem_b (after)
+            # LEVIR-MCI: label for both (semantic change type)
             if self.is_levir:
-                targets = batch['label']
+                targets_A = batch['label']
+                targets_B = batch['label']
             else:
-                targets = batch['sem_b']
-            
+                targets_A = batch['sem_a']
+                targets_B = batch['sem_b']
+
             # Forward pass
             outputs = self.model(rgb_a, rgb_b)
-            
-            # CD predictions
-            cd_logits = outputs['cd_logits']
-            cd_preds = cd_logits.argmax(dim=1)
-            
-            # Update CD metrics
-            self.cd_metrics.update(cd_preds.cpu(), targets)
-            
+
+            # v3.0: Get both sem_A and sem_B predictions
+            sem_A_logits = outputs.get('sem_A_logits')
+            sem_B_logits = outputs.get('sem_B_logits', outputs['cd_logits'])
+
+            # Update metrics for sem_B (after-change, primary evaluation)
+            sem_B_preds = sem_B_logits.argmax(dim=1)
+            self.sem_B_metrics.update(sem_B_preds.cpu(), targets_B)
+
+            # Update metrics for sem_A (before-change) if available
+            if sem_A_logits is not None:
+                sem_A_preds = sem_A_logits.argmax(dim=1)
+                self.sem_A_metrics.update(sem_A_preds.cpu(), targets_A)
+
             # Generate captions
             generated_captions = outputs.get('generated_captions')
             if generated_captions is not None:
@@ -164,59 +186,75 @@ class Evaluator:
                     pred_caption = self.vocab.decode(generated_captions[i]) if self.vocab else ""
                     all_predictions.append(pred_caption)
                     all_references.append(raw_captions[i])
-        
+
         # Update caption metrics
         if all_predictions:
             self.caption_metrics.update(all_predictions, all_references)
-        
+
         # Compute all metrics
-        cd_results = self.cd_metrics.compute()
+        sem_A_results = self.sem_A_metrics.compute()
+        sem_B_results = self.sem_B_metrics.compute()
         caption_results = self.caption_metrics.compute()
-        
+
         results = {
-            'cd': cd_results,
+            'sem_A': sem_A_results,  # Before-change semantic metrics
+            'sem_B': sem_B_results,  # After-change semantic metrics (primary)
+            'cd': sem_B_results,     # Backward compatibility alias
             'caption': caption_results
         }
-        
+
         return results
     
     def print_results(self, results: Dict[str, Any]):
-        """Print formatted results."""
+        """Print formatted results with v3.0 dual semantic metrics."""
         print("\n" + "=" * 60)
-        print(f"EVALUATION RESULTS - {self.dataset_name}")
+        print(f"EVALUATION RESULTS - {self.dataset_name} (v3.0)")
         print("=" * 60)
 
-        # CD metrics
+        # v3.0: Print both sem_A and sem_B metrics
         if self.is_levir:
-            metric_name = "Semantic Change Detection (3-class: no_change, building, road)"
+            class_info = "3-class: no_change, building, road"
         else:
-            metric_name = "Semantic Change Detection (7-class after-change semantics)"
-        print(f"\n{metric_name} Metrics:")
+            class_info = "7-class semantic"
+
+        # Before-change (sem_A) metrics
+        if 'sem_A' in results:
+            print(f"\nBefore-Change Semantics ({class_info}):")
+            print("-" * 40)
+            for metric, value in results['sem_A'].items():
+                print(f"  {metric:15s}: {value:.4f}")
+
+        # After-change (sem_B) metrics - primary evaluation
+        print(f"\nAfter-Change Semantics ({class_info}) [Primary]:")
         print("-" * 40)
-        for metric, value in results['cd'].items():
+        for metric, value in results['sem_B'].items():
             print(f"  {metric:15s}: {value:.4f}")
-        
+
         # Caption metrics
-        print("\n📝 Change Captioning Metrics:")
+        print("\nChange Captioning Metrics:")
         print("-" * 40)
         for metric, value in results['caption'].items():
             print(f"  {metric:15s}: {value:.4f}")
-        
+
         print("\n" + "=" * 60)
     
     def save_results(self, results: Dict[str, Any], output_path: str):
-        """Save results to JSON file."""
+        """Save results to JSON file with v3.0 metrics."""
         # Convert to serializable format
         results_json = {
             'dataset': self.dataset_name,
             'split': self.split,
-            'cd_metrics': {k: float(v) for k, v in results['cd'].items()},
+            'version': 'v3.0',
+            # v3.0: Include both sem_A and sem_B metrics
+            'sem_A_metrics': {k: float(v) for k, v in results.get('sem_A', {}).items()},
+            'sem_B_metrics': {k: float(v) for k, v in results['sem_B'].items()},
+            'cd_metrics': {k: float(v) for k, v in results['cd'].items()},  # Backward compat
             'caption_metrics': {k: float(v) for k, v in results['caption'].items()}
         }
-        
+
         with open(output_path, 'w') as f:
             json.dump(results_json, f, indent=2)
-        
+
         print(f"\nResults saved to: {output_path}")
 
 
