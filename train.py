@@ -268,6 +268,11 @@ class Trainer:
         print(f"  Trainable: {num_trainable:,}")
         print(f"  Dual Head: {self.dual_head}")
 
+        # Enable gradient checkpointing if configured
+        if self.config['training'].get('gradient_checkpointing', False):
+            self.model.set_gradient_checkpointing(True)
+            print(f"  Gradient Checkpointing: Enabled")
+
     def _setup_losses(self):
         """Setup loss functions."""
         loss_config = self.config['loss']
@@ -397,7 +402,7 @@ class Trainer:
         return total, loss_dict
 
     def train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch."""
+        """Train for one epoch with gradient accumulation support."""
         self.model.train()
 
         epoch_losses = {'total': 0, 'cd': 0, 'caption': 0}
@@ -406,6 +411,10 @@ class Trainer:
             epoch_losses['sem_B'] = 0
 
         num_batches = len(self.train_loader)
+
+        # Gradient accumulation settings
+        accum_steps = self.config['training'].get('gradient_accumulation_steps', 1)
+        empty_cache_freq = self.config['training'].get('empty_cache_freq', 0)
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch+1}")
 
@@ -426,41 +435,49 @@ class Trainer:
             captions = batch['captions'][:, 0].to(self.device)
             lengths = batch['caption_lengths'][:, 0].to(self.device)
 
-            # Forward
-            self.optimizer.zero_grad()
-
+            # Forward with gradient accumulation
             if self.use_amp:
                 with autocast():
                     outputs = self.model(rgb_a, rgb_b, captions, lengths)
                     loss, loss_dict = self._compute_loss(outputs, targets, captions, target_A)
+                    # Scale loss for gradient accumulation
+                    loss = loss / accum_steps
 
                 self.scaler.scale(loss).backward()
 
-                # Gradient clipping
-                if self.config['training'].get('gradient_clip'):
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config['training']['gradient_clip']
-                    )
+                # Step optimizer every accum_steps
+                if (batch_idx + 1) % accum_steps == 0:
+                    # Gradient clipping
+                    if self.config['training'].get('gradient_clip'):
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config['training']['gradient_clip']
+                        )
 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
             else:
                 outputs = self.model(rgb_a, rgb_b, captions, lengths)
                 loss, loss_dict = self._compute_loss(outputs, targets, captions, target_A)
+                # Scale loss for gradient accumulation
+                loss = loss / accum_steps
 
                 loss.backward()
 
-                if self.config['training'].get('gradient_clip'):
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config['training']['gradient_clip']
-                    )
+                # Step optimizer every accum_steps
+                if (batch_idx + 1) % accum_steps == 0:
+                    if self.config['training'].get('gradient_clip'):
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config['training']['gradient_clip']
+                        )
 
-                self.optimizer.step()
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
-            # Update metrics
+            # Update metrics (use unscaled loss for logging)
             for k, v in loss_dict.items():
                 epoch_losses[k] = epoch_losses.get(k, 0) + v
 
@@ -484,6 +501,10 @@ class Trainer:
                 if self.dual_head:
                     self.writer.add_scalar('train/sem_A', loss_dict.get('sem_A', 0), self.global_step)
                     self.writer.add_scalar('train/sem_B', loss_dict.get('sem_B', 0), self.global_step)
+
+            # Periodic cache clearing for memory optimization
+            if empty_cache_freq > 0 and (batch_idx + 1) % empty_cache_freq == 0:
+                torch.cuda.empty_cache()
 
         # Average losses
         for k in epoch_losses:
@@ -603,12 +624,19 @@ class Trainer:
     def train(self):
         """Main training loop."""
         num_epochs = self.config['training']['num_epochs']
+        accum_steps = self.config['training'].get('gradient_accumulation_steps', 1)
 
         # Monitor metric
         monitor = 'mIoU'
 
         print(f"\nStarting training for {num_epochs} epochs...")
-        print(f"Monitor metric: {monitor}\n")
+        print(f"Monitor metric: {monitor}")
+        print(f"Batch size: {self.config['training']['batch_size']}")
+        print(f"Gradient accumulation steps: {accum_steps}")
+        print(f"Effective batch size: {self.config['training']['batch_size'] * accum_steps}\n")
+
+        # Initial zero_grad for gradient accumulation
+        self.optimizer.zero_grad()
 
         for epoch in range(self.epoch, num_epochs):
             self.epoch = epoch

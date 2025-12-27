@@ -9,6 +9,7 @@ v3.0 Addition: TransitionCaptionDecoder
 - Attends to transition embeddings for "what changed into what"
 - Gated fusion of visual and transition attention
 - Enables generating descriptions like "vegetation was replaced by building"
+- Added gradient checkpointing support for memory optimization
 """
 
 import torch
@@ -16,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional
+from torch.utils.checkpoint import checkpoint
 
 
 class PositionalEncoding(nn.Module):
@@ -172,6 +174,13 @@ class SemanticCaptionDecoder(nn.Module):
 
         # Output projection
         self.output_proj = nn.Linear(d_model, vocab_size)
+
+        # Gradient checkpointing flag
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing for memory optimization."""
+        self.gradient_checkpointing = enable
 
     def _generate_causal_mask(self, size: int, device: torch.device) -> torch.Tensor:
         """Generate causal attention mask."""
@@ -470,6 +479,13 @@ class TransitionCaptionDecoder(nn.Module):
 
         # Output projection
         self.output_proj = nn.Linear(d_model, vocab_size)
+
+        # Gradient checkpointing flag
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing for memory optimization."""
+        self.gradient_checkpointing = enable
 
     def _generate_causal_mask(self, size: int, device: torch.device) -> torch.Tensor:
         """Generate causal attention mask."""

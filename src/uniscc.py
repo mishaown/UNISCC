@@ -445,6 +445,25 @@ class UniSCC(nn.Module):
         else:
             return sum(p.numel() for p in self.parameters())
 
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """
+        Enable or disable gradient checkpointing for memory optimization.
+
+        This trades compute for memory by recomputing activations during backward pass.
+        Can reduce memory usage by 30-50% at the cost of ~20% slower training.
+        """
+        # Enable for encoder
+        if hasattr(self.encoder, 'set_gradient_checkpointing'):
+            self.encoder.set_gradient_checkpointing(enable)
+
+        # Enable for TDT if it supports it
+        if hasattr(self.tdt, 'set_gradient_checkpointing'):
+            self.tdt.set_gradient_checkpointing(enable)
+
+        # Enable for caption decoder if it supports it
+        if hasattr(self.caption_decoder, 'set_gradient_checkpointing'):
+            self.caption_decoder.set_gradient_checkpointing(enable)
+
 
 def build_uniscc(config: Union[UniSCCConfig, dict]) -> UniSCC:
     """Build UniSCC model from configuration."""

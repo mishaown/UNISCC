@@ -1,10 +1,13 @@
 """
 Vision Encoder for UniSCC
 Implements Siamese encoder with temporal embeddings
+
+v3.0: Added gradient checkpointing support for memory optimization
 """
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 try:
     import timm
@@ -75,8 +78,10 @@ class UniSCCEncoder(nn.Module):
     """
     Siamese encoder for bi-temporal images
     Extracts features with shared weights and temporal embeddings
+
+    v3.0: Added gradient checkpointing for memory optimization
     """
-    
+
     def __init__(
         self,
         backbone: str = "swin_base_patch4_window7_224",
@@ -88,7 +93,8 @@ class UniSCCEncoder(nn.Module):
         super().__init__()
         self.feature_dim = feature_dim
         self.use_temporal_embed = use_temporal_embed
-        
+        self.gradient_checkpointing = False  # Can be enabled for memory saving
+
         # Build backbone
         if TIMM_AVAILABLE and "swin" in backbone.lower():
             self.backbone = timm.create_model(
@@ -106,59 +112,68 @@ class UniSCCEncoder(nn.Module):
             self.backbone = SimpleResNetBackbone(feature_dim)
             backbone_channels = feature_dim
             self.use_timm = False
-        
+
         # Project to feature_dim if needed
         if backbone_channels != feature_dim:
             self.proj = nn.Conv2d(backbone_channels, feature_dim, 1)
         else:
             self.proj = nn.Identity()
-        
+
         # Temporal embeddings
         if use_temporal_embed:
             self.temporal_embed = TemporalEmbedding(feature_dim)
         else:
             self.temporal_embed = None
-    
-    def forward_single(self, x: torch.Tensor, time_idx: int):
-        """Extract features from single image"""
-        # Get features from backbone
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing for memory optimization."""
+        self.gradient_checkpointing = enable
+        # Also enable for Swin backbone if available
+        if self.use_timm and hasattr(self.backbone, 'set_grad_checkpointing'):
+            self.backbone.set_grad_checkpointing(enable)
+
+    def _forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward through backbone (for checkpointing)."""
         if self.use_timm:
-            # timm model - returns list of features
             features = self.backbone(x)
-            x = features[-1]  # Use last stage (already filtered to only last stage)
-            
-            # Swin Transformer returns features in (B, H, W, C) format
-            # Need to convert to (B, C, H, W) for Conv2d
+            x = features[-1]
             if x.dim() == 4 and x.shape[1] != self.backbone.feature_info.channels()[-1]:
-                # Features are in (B, H, W, C) format - permute to (B, C, H, W)
                 x = x.permute(0, 3, 1, 2)
         else:
-            # Simple backbone
             x = self.backbone(x)
-        
+        return x
+
+    def forward_single(self, x: torch.Tensor, time_idx: int):
+        """Extract features from single image"""
+        # Get features from backbone with optional checkpointing
+        if self.gradient_checkpointing and self.training:
+            x = checkpoint(self._forward_backbone, x, use_reentrant=False)
+        else:
+            x = self._forward_backbone(x)
+
         # Project to target dimension
         x = self.proj(x)
-        
+
         # Add temporal embedding
         if self.temporal_embed is not None:
             x = self.temporal_embed(x, time_idx)
-        
+
         return x
-    
+
     def forward(self, img_t0: torch.Tensor, img_t1: torch.Tensor):
         """
         Forward pass for bi-temporal images
-        
+
         Args:
             img_t0: [B, 3, H, W] pre-change image
             img_t1: [B, 3, H, W] post-change image
-        
+
         Returns:
             dict with features_t0 and features_t1 [B, C, H', W']
         """
         feat_t0 = self.forward_single(img_t0, time_idx=0)
         feat_t1 = self.forward_single(img_t1, time_idx=1)
-        
+
         return {
             'features_t0': feat_t0,
             'features_t1': feat_t1
