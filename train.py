@@ -133,7 +133,7 @@ class DualSemanticCDLoss(nn.Module):
     def forward(
         self,
         outputs: Dict[str, torch.Tensor],
-        target_A: torch.Tensor,
+        target_A: Optional[torch.Tensor],
         target_B: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
@@ -141,7 +141,7 @@ class DualSemanticCDLoss(nn.Module):
 
         Args:
             outputs: Model outputs with 'sem_A_logits' and 'sem_B_logits'
-            target_A: [B, H, W] before-change ground truth
+            target_A: [B, H, W] before-change ground truth (optional)
             target_B: [B, H, W] after-change ground truth
 
         Returns:
@@ -150,21 +150,28 @@ class DualSemanticCDLoss(nn.Module):
         sem_A_logits = outputs['sem_A_logits']
         sem_B_logits = outputs['sem_B_logits']
 
-        losses = self.dual_loss(
-            sem_A_logits, sem_B_logits,
-            target_A, target_B
-        )
+        if target_A is None:
+            # No before-change labels (LEVIR-MCI): train only sem_B
+            if self.dual_loss.use_focal:
+                loss_B = self.dual_loss._focal_loss(sem_B_logits, target_B)
+            else:
+                loss_B = self.dual_loss.ce_loss(sem_B_logits, target_B)
+            loss_A = torch.tensor(0.0, device=sem_B_logits.device)
+        else:
+            losses = self.dual_loss(
+                sem_A_logits, sem_B_logits,
+                target_A, target_B
+            )
+            loss_A = losses['sem_A']
+            loss_B = losses['sem_B']
 
         # Apply weights
-        total = (
-            self.sem_A_weight * losses['sem_A'] +
-            self.sem_B_weight * losses['sem_B']
-        )
+        total = (self.sem_A_weight * loss_A) + (self.sem_B_weight * loss_B)
 
         loss_dict = {
             'cd': total.item(),
-            'sem_A': losses['sem_A'].item(),
-            'sem_B': losses['sem_B'].item(),
+            'sem_A': loss_A.item(),
+            'sem_B': loss_B.item(),
         }
 
         return total, loss_dict
@@ -372,7 +379,7 @@ class Trainer:
         loss_dict = {}
 
         # v3.0: Dual head loss
-        if self.dual_head and target_A is not None:
+        if self.dual_head:
             cd_loss, cd_loss_dict = self.cd_loss(outputs, target_A, targets)
         else:
             # Legacy: single target
