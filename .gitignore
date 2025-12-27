@@ -1,6 +1,5 @@
 /checkpoints
 /results
-ARCHITECTURE.md
 CHANGES.md
 check_imports.py
 test_fix.py
@@ -8,7 +7,6 @@ files.py
 quick_test.py
 huggingface_cache.zip
 torch_cache.zip
-PROJECT_SUMMARY.md
 test_v3.py
 
 # Byte-compiled / optimized / DLL files
