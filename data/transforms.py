@@ -68,8 +68,8 @@ class PairedTransform:
         self,
         rgb_a: Image.Image,
         rgb_b: Image.Image,
-        label: Optional[Image.Image] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        label: Optional[Union[Image.Image, Tuple[Image.Image, ...], list]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...], list]]]:
         """
         Apply transforms to image pair and optional label.
         
@@ -85,8 +85,14 @@ class PairedTransform:
         rgb_a = TF.resize(rgb_a, [self.image_size, self.image_size])
         rgb_b = TF.resize(rgb_b, [self.image_size, self.image_size])
         if label is not None:
-            label = TF.resize(label, [self.image_size, self.image_size],
-                            interpolation=TF.InterpolationMode.NEAREST)
+            label = self._apply_to_label(
+                label,
+                lambda img: TF.resize(
+                    img,
+                    [self.image_size, self.image_size],
+                    interpolation=TF.InterpolationMode.NEAREST
+                )
+            )
         
         # Apply augmentation during training
         if self.is_train:
@@ -99,20 +105,39 @@ class PairedTransform:
             rgb_b = TF.to_tensor(rgb_b)
         
         if label is not None:
-            label = torch.from_numpy(np.array(label)).long()
+            label = self._labels_to_tensor(label)
         
         # Normalize RGB
         rgb_a = self.normalize(rgb_a)
         rgb_b = self.normalize(rgb_b)
         
         return rgb_a, rgb_b, label
+
+    def _apply_to_label(self, label, fn):
+        if label is None:
+            return None
+        if isinstance(label, (list, tuple)):
+            return type(label)(fn(item) for item in label)
+        return fn(label)
+
+    def _labels_to_tensor(self, label):
+        if label is None:
+            return None
+        if isinstance(label, (list, tuple)):
+            return type(label)(
+                item.long() if torch.is_tensor(item) else torch.from_numpy(np.array(item)).long()
+                for item in label
+            )
+        if torch.is_tensor(label):
+            return label.long()
+        return torch.from_numpy(np.array(label)).long()
     
     def _augment(
         self,
         rgb_a: Image.Image,
         rgb_b: Image.Image,
-        label: Optional[Image.Image]
-    ) -> Tuple[Image.Image, Image.Image, Optional[Image.Image]]:
+        label: Optional[Union[Image.Image, Tuple[Image.Image, ...], list]]
+    ) -> Tuple[Image.Image, Image.Image, Optional[Union[Image.Image, Tuple[Image.Image, ...], list]]]:
         """Apply spatial and color augmentations."""
         
         train_aug = self.aug.get('train', {})
@@ -122,14 +147,14 @@ class PairedTransform:
             rgb_a = TF.hflip(rgb_a)
             rgb_b = TF.hflip(rgb_b)
             if label is not None:
-                label = TF.hflip(label)
+                label = self._apply_to_label(label, TF.hflip)
         
         # Vertical flip
         if random.random() < train_aug.get('vertical_flip', 0.5):
             rgb_a = TF.vflip(rgb_a)
             rgb_b = TF.vflip(rgb_b)
             if label is not None:
-                label = TF.vflip(label)
+                label = self._apply_to_label(label, TF.vflip)
         
         # Random rotation (90 degree increments)
         if random.random() < train_aug.get('rotation', 0.3):
@@ -137,7 +162,10 @@ class PairedTransform:
             rgb_a = TF.rotate(rgb_a, angle)
             rgb_b = TF.rotate(rgb_b, angle)
             if label is not None:
-                label = TF.rotate(label, angle)
+                label = self._apply_to_label(
+                    label,
+                    lambda img: TF.rotate(img, angle, interpolation=TF.InterpolationMode.NEAREST)
+                )
         
         # Color jitter (same transform for both images)
         cj_config = train_aug.get('color_jitter', {})

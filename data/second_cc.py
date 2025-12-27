@@ -100,19 +100,21 @@ class SECONDCCDataset(Dataset):
         sem_a = Image.open(self.root / filepath / "sem" / "A" / filename).convert('L')
         sem_b = Image.open(self.root / filepath / "sem" / "B" / filename).convert('L')
         
-        # Apply transforms to RGB images only, handle semantic maps separately
-        rgb_a_t, rgb_b_t, _ = self.transform(rgb_a, rgb_b, None)
-        
-        # Convert semantic maps
-        sem_a = torch.from_numpy(np.array(sem_a.resize((256, 256), Image.NEAREST))).long()
-        sem_b = torch.from_numpy(np.array(sem_b.resize((256, 256), Image.NEAREST))).long()
-        
+        # Apply transforms to RGB and semantic maps together
+        rgb_a_t, rgb_b_t, labels = self.transform(rgb_a, rgb_b, (sem_a, sem_b))
+
+        if labels is None:
+            sem_a_t = torch.from_numpy(np.array(sem_a)).long()
+            sem_b_t = torch.from_numpy(np.array(sem_b)).long()
+        else:
+            sem_a_t, sem_b_t = labels
+
         # Compute semantic change map (transition encoding)
         # change_id = sem_a * K + sem_b where K = num_classes
-        invalid = (sem_a == 255) | (sem_b == 255)
-        sem_a = sem_a.clamp(0, self.NUM_CLASSES - 1)
-        sem_b = sem_b.clamp(0, self.NUM_CLASSES - 1)
-        change_map = sem_a * self.NUM_CLASSES + sem_b
+        invalid = (sem_a_t == 255) | (sem_b_t == 255)
+        sem_a_map = sem_a_t.clamp(0, self.NUM_CLASSES - 1)
+        sem_b_map = sem_b_t.clamp(0, self.NUM_CLASSES - 1)
+        change_map = sem_a_map * self.NUM_CLASSES + sem_b_map
         change_map[invalid] = 255
         
         # Process captions
@@ -145,8 +147,8 @@ class SECONDCCDataset(Dataset):
         return {
             'rgb_a': rgb_a_t,
             'rgb_b': rgb_b_t,
-            'sem_a': sem_a,
-            'sem_b': sem_b,
+            'sem_a': sem_a_t,
+            'sem_b': sem_b_t,
             'change_map': change_map,
             'captions': torch.stack(encoded_captions),
             'caption_lengths': torch.tensor(caption_lengths),

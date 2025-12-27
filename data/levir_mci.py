@@ -107,27 +107,29 @@ class LEVIRMCIDataset(Dataset):
         label_rgb_path = self.root / "images" / split_dir / "label_rgb" / filename
         if label_rgb_path.exists():
             label_rgb = Image.open(label_rgb_path).convert('RGB')
+            label_img = label_rgb
         else:
             # Fallback to regular label if label_rgb doesn't exist
             label_path = self.root / "images" / split_dir / "label" / filename
             if label_path.exists():
                 label = Image.open(label_path)
                 label_rgb = None
+                label_img = label
             else:
                 label = Image.fromarray(np.zeros((256, 256), dtype=np.uint8))
                 label_rgb = None
+                label_img = label
 
-        # Apply transforms to RGB images only
-        rgb_a_t, rgb_b_t, _ = self.transform(rgb_a, rgb_b, None)
+        # Apply transforms to RGB images and labels together
+        rgb_a_t, rgb_b_t, label_t = self.transform(rgb_a, rgb_b, label_img)
 
         # Convert label_rgb to class indices
         if label_rgb is not None:
-            # Resize label_rgb to match image size
-            label_rgb = label_rgb.resize((256, 256), Image.NEAREST)
-            label_array = np.array(label_rgb)
+            label_array = label_t.cpu().numpy()
 
             # Map RGB colors to class IDs
-            label_t = np.zeros((256, 256), dtype=np.int64)
+            height, width = label_array.shape[:2]
+            label_t = np.zeros((height, width), dtype=np.int64)
             for color, class_id in self.COLOR_MAP.items():
                 mask = (label_array[:, :, 0] == color[0]) & \
                        (label_array[:, :, 1] == color[1]) & \
@@ -136,8 +138,8 @@ class LEVIRMCIDataset(Dataset):
             label_t = torch.from_numpy(label_t).long()
         else:
             # Fallback: use binary label
-            label = label.resize((256, 256), Image.NEAREST)
-            label_t = torch.from_numpy(np.array(label)).long()
+            if label_t.dim() == 3:
+                label_t = label_t[:, :, 0]
             # Ensure binary values
             label_t = (label_t > 0).long()
         
