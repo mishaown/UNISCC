@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 """
-UniSCC Inference Script (v3.0)
+UniSCC Inference Script (v4.0)
 
-Run inference on single image pairs or directories with dual semantic output.
+Run inference on single image pairs or directories with feature alignment.
 
-v3.0 Features:
-- Predicts both before-change (sem_A) and after-change (sem_B) semantic maps
-- Derives change mask from semantic predictions
-- Uses transition-aware caption decoder
+v4.0 Features:
+- Feature alignment for bitemporal images (cross-attention, deformable, hierarchical)
+- Single semantic head (after-change prediction)
+- Shared semantic space between CD and captioning
 
 Outputs:
-- sem_A.npy: Before-change semantic map
-- sem_B.npy: After-change semantic map
-- change_map.npy: Same as sem_B (backward compat)
-- change_mask.npy: Binary change mask (where sem_A != sem_B)
+- change_map.npy: Semantic change map (after-change classes)
 - caption.txt: Generated change caption
 - viz.png: Visualization with all outputs
 
 Usage:
-    python inference.py --config configs/levir_mci.yaml \\
-                        --checkpoint checkpoints/best.pth \\
-                        --image_a path/to/before.png \\
+    python inference.py --config configs/levir_mci.yaml \
+                        --checkpoint checkpoints/best.pth \
+                        --image_a path/to/before.png \
                         --image_b path/to/after.png
 
-    python inference.py --config configs/second_cc.yaml \\
-                        --checkpoint checkpoints/best.pth \\
-                        --input_dir path/to/images/ \\
+    python inference.py --config configs/second_cc.yaml \
+                        --checkpoint checkpoints/best.pth \
+                        --input_dir path/to/images/ \
                         --output_dir outputs/
 """
 
@@ -64,20 +61,20 @@ def load_config(config_path: str) -> dict:
 
 
 class Inferencer:
-    """UniSCC Inference Engine."""
-    
+    """UniSCC Inference Engine v4.0."""
+
     def __init__(self, config: dict, checkpoint_path: str):
         self.config = config
         self.device = torch.device(
             config['hardware']['device'] if torch.cuda.is_available() else 'cpu'
         )
-        
+
         # Dataset info
         self.dataset_name = config['dataset']['name']
         self.is_levir = self.dataset_name == 'LEVIR-MCI'
         self.num_classes = config['dataset']['num_classes']
         self.image_size = config['dataset']['image_size']
-        
+
         # Setup transform
         normalize_type = 'levir_mci' if self.dataset_name == 'LEVIR-MCI' else 'second_cc'
         self.transform = PairedTransform(
@@ -85,13 +82,13 @@ class Inferencer:
             is_train=False,
             normalize_type=normalize_type
         )
-        
+
         # Load vocabulary
         self._load_vocab()
-        
+
         # Load model
         self._load_model(checkpoint_path)
-        
+
         # Visualization settings
         if self.is_levir:
             self.colors = LEVIR_MCI_COLORS
@@ -99,7 +96,7 @@ class Inferencer:
         else:
             self.colors = SECOND_CC_COLORS
             self.class_names = SECOND_CC_NAMES
-    
+
     def _load_vocab(self):
         """Load or create vocabulary."""
         vocab_path = self.config.get('vocab_path')
@@ -115,26 +112,30 @@ class Inferencer:
                 'water', 'road', 'roads', 'ground', 'scene', 'area', 'region'
             ]
             self.vocab.build_vocab([[w] for w in common_words])
-    
+
     def _load_model(self, checkpoint_path: str):
-        """Load model from checkpoint with v3.0 configuration."""
+        """Load model from checkpoint with v4.0 configuration."""
+        print(f"\n{'='*60}")
+        print(f"UniSCC v4.0 Inference - {self.dataset_name}")
+        print(f"{'='*60}\n")
+
         # Determine dataset type
         dataset_type = 'levir_mci' if self.is_levir else 'second_cc'
 
-        # Build model using v3.0 config with dual semantic head
+        # Build model using v4.0 config with alignment
         model_cfg = self.config.get('model', {})
         config = UniSCCConfig(
             dataset=dataset_type,
             backbone=model_cfg.get('encoder', {}).get('backbone', 'swin_base_patch4_window7_224'),
             feature_dim=model_cfg.get('tdt', {}).get('hidden_dim', 512),
             vocab_size=len(self.vocab),
-            # v3.0: Semantic class configuration
-            num_semantic_classes=7,  # SECOND-CC semantic classes
-            num_change_classes=3,    # LEVIR-MCI change classes
+            num_semantic_classes=self.num_classes if not self.is_levir else 7,
+            num_change_classes=self.num_classes if self.is_levir else 3,
             max_caption_length=self.config['dataset'].get('max_caption_length', 50),
-            # v3.0: Enable dual head with transition prompts
-            dual_head=True,
-            use_transition_attention=True
+            # v4.0: Alignment configuration
+            use_alignment=model_cfg.get('use_alignment', True),
+            alignment_type=model_cfg.get('alignment_type', 'cross_attention'),
+            alignment_heads=model_cfg.get('alignment_heads', 8),
         )
         self.model = UniSCC(config).to(self.device)
 
@@ -142,14 +143,17 @@ class Inferencer:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded checkpoint: {checkpoint_path}")
+            print(f"  Epoch: {checkpoint.get('epoch', 'N/A')}")
         else:
             print(f"Warning: Checkpoint not found, using random weights")
 
         self.model.eval()
-    
+        print(f"  Alignment: {config.alignment_type if config.use_alignment else 'Disabled'}")
+        print(f"  Classes: {self.num_classes}")
+
     @torch.no_grad()
     def predict(self, image_a: Image.Image, image_b: Image.Image) -> Dict[str, Any]:
-        """Run inference on image pair with v3.0 dual semantic output."""
+        """Run inference on image pair with v4.0 single semantic output."""
         # Transform images
         rgb_a, rgb_b, _ = self.transform(image_a, image_b, None)
         rgb_a = rgb_a.unsqueeze(0).to(self.device)
@@ -158,23 +162,15 @@ class Inferencer:
         # Forward pass
         outputs = self.model(rgb_a, rgb_b)
 
-        # v3.0: Get both before and after semantic predictions
-        sem_A_logits = outputs.get('sem_A_logits')
-        sem_B_logits = outputs.get('sem_B_logits', outputs['cd_logits'])
+        # v4.0: Get semantic change predictions (after-change classes)
+        cd_logits = outputs['cd_logits']
+        cd_probs = F.softmax(cd_logits, dim=1)
+        change_map = cd_logits.argmax(dim=1).squeeze(0).cpu().numpy()
 
-        # After-change predictions (primary output)
-        sem_B_probs = F.softmax(sem_B_logits, dim=1)
-        sem_B_pred = sem_B_logits.argmax(dim=1).squeeze(0).cpu().numpy()
-
-        # Before-change predictions (v3.0)
-        sem_A_pred = None
-        if sem_A_logits is not None:
-            sem_A_pred = sem_A_logits.argmax(dim=1).squeeze(0).cpu().numpy()
-
-        # v3.0: Get derived change mask
-        change_mask = outputs.get('change_mask')
-        if change_mask is not None:
-            change_mask = change_mask.squeeze(0).cpu().numpy()
+        # Get alignment confidence if available
+        alignment_confidence = outputs.get('alignment_confidence')
+        if alignment_confidence is not None:
+            alignment_confidence = alignment_confidence.squeeze(0).cpu().numpy()
 
         # Caption from generated tokens
         generated_captions = outputs.get('generated_captions')
@@ -190,19 +186,16 @@ class Inferencer:
                 caption = "No caption generated"
 
         return {
-            'change_map': sem_B_pred,  # After-change semantic map (primary)
-            'change_probs': sem_B_probs.squeeze(0).cpu().numpy(),
+            'change_map': change_map,
+            'change_probs': cd_probs.squeeze(0).cpu().numpy(),
             'caption': caption,
-            # v3.0 additions
-            'sem_A_map': sem_A_pred,   # Before-change semantic map
-            'sem_B_map': sem_B_pred,   # After-change semantic map
-            'change_mask': change_mask  # Derived binary change mask
+            'alignment_confidence': alignment_confidence,
         }
-    
+
     def colorize_map(self, change_map: np.ndarray) -> np.ndarray:
         """Convert change map to RGB.
 
-        Both datasets now output semantic class predictions directly:
+        v4.0: Both datasets output semantic class predictions directly:
         - SECOND-CC: 7 after-change semantic classes
         - LEVIR-MCI: 3 semantic classes (no_change, building, road)
         """
@@ -213,7 +206,7 @@ class Inferencer:
             rgb[change_map == class_id] = color
 
         return rgb
-    
+
     def visualize(
         self,
         image_a: Image.Image,
@@ -221,77 +214,46 @@ class Inferencer:
         results: Dict[str, Any],
         save_path: Optional[str] = None
     ) -> plt.Figure:
-        """Create v3.0 visualization with before/after semantics."""
-        # Determine layout based on available outputs
-        has_dual = results.get('sem_A_map') is not None
-        has_change_mask = results.get('change_mask') is not None
+        """Create v4.0 visualization."""
+        has_alignment = results.get('alignment_confidence') is not None
 
-        if has_dual:
-            # v3.0: Show before semantic, after semantic, and change mask
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        if has_alignment:
+            fig, axes = plt.subplots(2, 2, figsize=(12, 12))
             axes = axes.flatten()
-
-            # Row 1: Images
-            axes[0].imshow(image_a.resize((self.image_size, self.image_size)))
-            axes[0].set_title('Before Image', fontsize=12, fontweight='bold')
-            axes[0].axis('off')
-
-            axes[1].imshow(image_b.resize((self.image_size, self.image_size)))
-            axes[1].set_title('After Image', fontsize=12, fontweight='bold')
-            axes[1].axis('off')
-
-            # Change mask (if available)
-            if has_change_mask:
-                axes[2].imshow(results['change_mask'], cmap='gray')
-                axes[2].set_title('Change Mask', fontsize=12, fontweight='bold')
-            else:
-                axes[2].axis('off')
-            axes[2].axis('off')
-
-            # Row 2: Semantic maps and caption
-            sem_A_rgb = self.colorize_map(results['sem_A_map'])
-            axes[3].imshow(sem_A_rgb)
-            axes[3].set_title('Before Semantics', fontsize=12, fontweight='bold')
-            axes[3].axis('off')
-
-            sem_B_rgb = self.colorize_map(results['sem_B_map'])
-            axes[4].imshow(sem_B_rgb)
-            axes[4].set_title('After Semantics', fontsize=12, fontweight='bold')
-            axes[4].axis('off')
-
-            # Caption
-            axes[5].text(0.5, 0.5, f'"{results["caption"]}"',
-                        ha='center', va='center', fontsize=11, wrap=True,
-                        transform=axes[5].transAxes,
-                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-            axes[5].set_title('Generated Caption', fontsize=12, fontweight='bold')
-            axes[5].axis('off')
-
-            # Add legend to semantic maps
-            patches = [mpatches.Patch(color=np.array(c)/255, label=n)
-                       for n, c in zip(self.class_names, self.colors.values())]
-            fig.legend(handles=patches, loc='lower center', ncol=len(patches), fontsize=9)
         else:
-            # Legacy layout
             fig, axes = plt.subplots(1, 4, figsize=(20, 5))
 
-            axes[0].imshow(image_a.resize((self.image_size, self.image_size)))
-            axes[0].set_title('Before', fontsize=12, fontweight='bold')
-            axes[0].axis('off')
+        # Before image
+        axes[0].imshow(image_a.resize((self.image_size, self.image_size)))
+        axes[0].set_title('Before Image', fontsize=12, fontweight='bold')
+        axes[0].axis('off')
 
-            axes[1].imshow(image_b.resize((self.image_size, self.image_size)))
-            axes[1].set_title('After', fontsize=12, fontweight='bold')
-            axes[1].axis('off')
+        # After image
+        axes[1].imshow(image_b.resize((self.image_size, self.image_size)))
+        axes[1].set_title('After Image', fontsize=12, fontweight='bold')
+        axes[1].axis('off')
 
-            change_rgb = self.colorize_map(results['change_map'])
-            axes[2].imshow(change_rgb)
-            axes[2].set_title('Change Map', fontsize=12, fontweight='bold')
-            axes[2].axis('off')
+        # Change map
+        change_rgb = self.colorize_map(results['change_map'])
+        axes[2].imshow(change_rgb)
+        axes[2].set_title('Semantic Change Map', fontsize=12, fontweight='bold')
+        axes[2].axis('off')
 
-            patches = [mpatches.Patch(color=np.array(c)/255, label=n)
-                       for n, c in zip(self.class_names, self.colors.values())]
-            axes[2].legend(handles=patches, loc='upper right', fontsize=8)
+        # Add legend
+        patches = [mpatches.Patch(color=np.array(c)/255, label=n)
+                   for n, c in zip(self.class_names, self.colors.values())]
+        axes[2].legend(handles=patches, loc='upper right', fontsize=8)
 
+        # Caption (or alignment confidence)
+        if has_alignment:
+            # Show alignment confidence as heatmap
+            axes[3].text(0.5, 0.7, f'"{results["caption"]}"',
+                        ha='center', va='center', fontsize=11, wrap=True,
+                        transform=axes[3].transAxes,
+                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            axes[3].set_title('Generated Caption', fontsize=12, fontweight='bold')
+            axes[3].axis('off')
+        else:
             axes[3].text(0.5, 0.5, f'"{results["caption"]}"',
                         ha='center', va='center', fontsize=12, wrap=True,
                         transform=axes[3].transAxes,
@@ -299,6 +261,7 @@ class Inferencer:
             axes[3].set_title('Generated Caption', fontsize=12, fontweight='bold')
             axes[3].axis('off')
 
+        plt.suptitle('UniSCC v4.0 - Feature Alignment', fontsize=14, fontweight='bold')
         plt.tight_layout()
 
         if save_path:
@@ -306,7 +269,7 @@ class Inferencer:
             print(f"Saved: {save_path}")
 
         return fig
-    
+
     def process_pair(
         self,
         image_a_path: str,
@@ -314,7 +277,7 @@ class Inferencer:
         output_dir: str,
         output_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Process a single image pair with v3.0 outputs."""
+        """Process a single image pair with v4.0 outputs."""
         # Load images
         image_a = Image.open(image_a_path).convert('RGB')
         image_b = Image.open(image_b_path).convert('RGB')
@@ -329,17 +292,8 @@ class Inferencer:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # v3.0: Save both semantic maps
-        if results.get('sem_A_map') is not None:
-            np.save(output_dir / f'{output_name}_sem_A.npy', results['sem_A_map'])
-        if results.get('sem_B_map') is not None:
-            np.save(output_dir / f'{output_name}_sem_B.npy', results['sem_B_map'])
-        # Backward compat: save change_map (same as sem_B)
+        # Save change map
         np.save(output_dir / f'{output_name}_change_map.npy', results['change_map'])
-
-        # v3.0: Save change mask if available
-        if results.get('change_mask') is not None:
-            np.save(output_dir / f'{output_name}_change_mask.npy', results['change_mask'])
 
         # Save caption
         with open(output_dir / f'{output_name}_caption.txt', 'w') as f:
@@ -350,7 +304,7 @@ class Inferencer:
                       save_path=str(output_dir / f'{output_name}_viz.png'))
 
         return results
-    
+
     def process_directory(
         self,
         input_dir: str,
@@ -361,28 +315,28 @@ class Inferencer:
         """Process all image pairs in directory."""
         input_dir = Path(input_dir)
         results_list = []
-        
+
         images_a = sorted(input_dir.glob(pattern_a))
-        
+
         for img_a_path in images_a:
             img_b_path = input_dir / img_a_path.name.replace('_A', '_B')
-            
+
             if not img_b_path.exists():
                 print(f"Warning: No matching B image for {img_a_path}")
                 continue
-            
+
             name = img_a_path.stem.replace('_A', '')
             print(f"Processing: {name}")
-            
+
             results = self.process_pair(str(img_a_path), str(img_b_path), output_dir, name)
             results_list.append(results)
-        
+
         print(f"\nProcessed {len(results_list)} image pairs")
         return results_list
 
 
 def main():
-    parser = argparse.ArgumentParser(description='UniSCC Inference')
+    parser = argparse.ArgumentParser(description='UniSCC v4.0 Inference')
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--image_a', type=str, default=None)
@@ -390,32 +344,30 @@ def main():
     parser.add_argument('--input_dir', type=str, default=None)
     parser.add_argument('--output_dir', type=str, default='./outputs')
     args = parser.parse_args()
-    
+
     # Validate input
     if args.image_a is None and args.input_dir is None:
         parser.error("Either --image_a/--image_b or --input_dir required")
-    
+
     if args.image_a and not args.image_b:
         parser.error("--image_b required with --image_a")
-    
+
     # Load config
     config = load_config(args.config)
-    
+
     # Create inferencer
     inferencer = Inferencer(config, args.checkpoint)
-    
+
     # Run inference
     if args.input_dir:
         inferencer.process_directory(args.input_dir, args.output_dir)
     else:
         results = inferencer.process_pair(args.image_a, args.image_b, args.output_dir)
-        print(f"\n=== v3.0 Results ===")
+        print(f"\n=== v4.0 Results ===")
         print(f"Caption: {results['caption']}")
-        print(f"After-change map shape: {results['change_map'].shape}")
-        if results.get('sem_A_map') is not None:
-            print(f"Before-change map shape: {results['sem_A_map'].shape}")
-        if results.get('change_mask') is not None:
-            print(f"Change mask shape: {results['change_mask'].shape}")
+        print(f"Change map shape: {results['change_map'].shape}")
+        if results.get('alignment_confidence') is not None:
+            print(f"Alignment confidence: mean={results['alignment_confidence'].mean():.3f}")
 
 
 if __name__ == '__main__':

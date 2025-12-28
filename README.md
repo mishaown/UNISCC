@@ -2,13 +2,12 @@
 
 A unified framework for joint Semantic Change Detection (SCD) and Change Captioning (CC) on remote sensing imagery.
 
-## v3.0 Features
+## v4.0 Features
 
-- **Dual Semantic Head**: Predicts both before-change (sem_A) and after-change (sem_B) semantic maps
-- **Transition-aware Captioning**: Uses transition embeddings for "what changed into what" descriptions
-- **Derived Change Mask**: Automatically computes binary change mask where sem_A != sem_B
-- **Focal Loss**: Handles class imbalance with configurable focal loss
-- **Memory Optimization**: Gradient checkpointing and accumulation for large models
+- **Feature Alignment**: Cross-attention, deformable, or hierarchical alignment for bitemporal images
+- **Single Semantic Head**: Predicts after-change semantic classes with shared CD-captioning space
+- **Learnable Semantic Prompts**: CLIP-initialized prompts for semantic-aware feature enhancement
+- **Optimized Training**: cuDNN benchmark, non-blocking transfers, persistent workers
 
 ## Supported Datasets
 
@@ -17,7 +16,7 @@ A unified framework for joint Semantic Change Detection (SCD) and Change Caption
 |-----------|-------|
 | Images | 6,041 bitemporal pairs (256x256) |
 | Task | 7-class semantic change detection + captioning |
-| Annotations | Semantic maps (sem_a, sem_b) + 5 captions/image |
+| Annotations | Semantic maps (RGB) + 5 captions/image |
 | Classes | background, low_vegetation, ground, tree, water, building, playground |
 
 ### LEVIR-MCI (Multi-level Change Interpretation)
@@ -44,18 +43,16 @@ pip install -r requirements.txt
 from src import UniSCC, UniSCCConfig
 import torch
 
-# Create model with v3.0 dual semantic head
+# Create model with v4.0 feature alignment
 config = UniSCCConfig(
     dataset='second_cc',
     vocab_size=10000,
     pretrained=True,
-    dual_head=True,
-    use_transition_attention=True
+    use_alignment=True,
+    alignment_type='cross_attention',  # or 'deformable', 'hierarchical'
+    alignment_heads=8
 )
 model = UniSCC(config)
-
-# Enable gradient checkpointing for memory optimization
-model.set_gradient_checkpointing(True)
 
 # Prepare inputs
 img_t0 = torch.randn(2, 3, 256, 256)  # Before
@@ -67,12 +64,10 @@ lengths = torch.tensor([30, 25])
 model.train()
 outputs = model(img_t0, img_t1, captions, lengths)
 
-# v3.0 outputs
-sem_A_logits = outputs['sem_A_logits']    # [B, 7, 256, 256] before-change
-sem_B_logits = outputs['sem_B_logits']    # [B, 7, 256, 256] after-change
-change_mask = outputs['change_mask']       # [B, 256, 256] derived
-caption_logits = outputs['caption_logits'] # [B, T, V]
-cd_logits = outputs['cd_logits']           # Alias for sem_B_logits
+# v4.0 outputs
+cd_logits = outputs['cd_logits']              # [B, K, 256, 256] semantic change map
+caption_logits = outputs['caption_logits']    # [B, T, V]
+alignment_conf = outputs['alignment_confidence']  # [B, H, W] confidence map
 
 # Inference
 model.eval()
@@ -81,10 +76,10 @@ with torch.no_grad():
     generated = outputs['generated_captions']
 ```
 
-### Run Sanity Checks
+### Run Tests
 
 ```bash
-python -m src.sanity_check
+python test_v4.py
 ```
 
 ## Project Structure
@@ -95,15 +90,16 @@ UniSCC/
 │   ├── second_cc.yaml
 │   └── levir_mci.yaml
 ├── src/
-│   ├── encoder.py           # Siamese Swin Transformer + gradient checkpointing
+│   ├── encoder.py           # Siamese Swin Transformer
+│   ├── alignment.py         # Feature alignment modules (v4.0)
 │   ├── tdt.py               # Temporal Difference Transformer
-│   ├── lsp.py               # TransitionLSP with dual prompts
-│   ├── semantic_head.py     # DualSemanticHead + DualSemanticLoss
-│   ├── caption_decoder.py   # TransitionCaptionDecoder
-│   ├── uniscc.py            # Main model (v3.0)
-│   └── sanity_check.py      # Model verification tests
+│   ├── lsp.py               # Learnable Semantic Prompts
+│   ├── semantic_head.py     # Semantic Change Detection Head
+│   ├── caption_decoder.py   # Semantic Caption Decoder
+│   ├── uniscc.py            # Main model (v4.0)
+│   └── __init__.py
 ├── data/
-│   ├── second_cc.py
+│   ├── second_cc.py         # SECOND-CC dataset with RGB label handling
 │   ├── levir_mci.py
 │   ├── vocabulary.py
 │   └── transforms.py
@@ -120,7 +116,7 @@ UniSCC/
 
 ## Training
 
-### Memory-Optimized Training (Default)
+### Optimized Training (Default)
 
 ```bash
 # SECOND-CC (batch=4, accum=3, effective=12)
@@ -139,8 +135,8 @@ python train.py --config configs/second_cc.yaml --resume checkpoints/last.pth
 |-----------|---------|-------------|
 | `batch_size` | 4 | Batch size per step |
 | `gradient_accumulation_steps` | 3 | Accumulation steps (effective batch=12) |
-| `gradient_checkpointing` | true | Trade compute for memory |
-| `num_workers` | 4 | DataLoader workers |
+| `gradient_checkpointing` | false | Trade compute for memory (enable if OOM) |
+| `num_workers` | 8 | DataLoader workers |
 | `amp.enabled` | true | Mixed precision training |
 
 ## Evaluation
@@ -151,9 +147,8 @@ python evaluate.py --config configs/second_cc.yaml \
                    --split test
 ```
 
-### v3.0 Evaluation Output
-- **sem_A metrics**: mIoU, F1, OA for before-change prediction
-- **sem_B metrics**: mIoU, F1, OA for after-change prediction (primary)
+### v4.0 Evaluation Output
+- **CD metrics**: mIoU, F1, OA for after-change semantic prediction
 - **Caption metrics**: BLEU-1/2/3/4, METEOR, ROUGE-L, CIDEr
 
 ## Inference
@@ -166,45 +161,47 @@ python inference.py --config configs/second_cc.yaml \
                     --output_dir outputs/
 ```
 
-### v3.0 Inference Outputs
-- `*_sem_A.npy`: Before-change semantic map
-- `*_sem_B.npy`: After-change semantic map
-- `*_change_mask.npy`: Derived binary change mask
+### v4.0 Inference Outputs
+- `*_change_map.npy`: Semantic change map (after-change classes)
 - `*_caption.txt`: Generated caption
-- `*_viz.png`: 2x3 visualization grid
+- `*_viz.png`: Visualization
 
-## Model Architecture (v3.0)
+## Model Architecture (v4.0)
 
 ```
 img_t0, img_t1 [B,3,256,256]
        │
        ▼
 ┌──────────────────────┐
-│ Encoder (Swin-B)     │──► feat_t0, feat_t1 [B,512,8,8]
-│ + Gradient Checkpoint│
+│ Encoder (Swin-B)     │──► feat_t0, feat_t1 [B,1024,8,8]
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ TDT (3 layers)       │──► {diff, feat_t0_enh, feat_t1_enh}
+│ Feature Alignment    │──► aligned_t0, aligned_t1 + confidence
+│ (Cross-Attention)    │
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ TransitionLSP        │──► prompts_A, prompts_B, transitions
+│ TDT (3 layers)       │──► diff_features [B,512,8,8]
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ DualSemanticHead     │──► sem_A_logits [B,K,256,256]
-│                      │──► sem_B_logits [B,K,256,256]
-│                      │──► change_mask [B,256,256]
+│ Learnable Semantic   │──► semantic_features [B,512,8,8]
+│ Prompts (CLIP-init)  │
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ TransitionCaption    │──► caption_logits [B,T,V]
-│ Decoder              │
+│ Semantic Change Head │──► cd_logits [B,K,256,256]
+└──────────────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Caption Decoder      │──► caption_logits [B,T,V]
+│ (Shared Semantic)    │
 └──────────────────────┘
 ```
 
@@ -220,34 +217,40 @@ UniSCCConfig(
     pretrained=True,
     feature_dim=512,
 
+    # v4.0 Alignment
+    use_alignment=True,
+    alignment_type='cross_attention',  # 'cross_attention', 'deformable', 'hierarchical'
+    alignment_heads=8,
+
     # Architecture
     tdt_layers=3,
     decoder_layers=6,
-    num_semantic_classes=7,           # SECOND-CC
-    num_change_classes=3,             # LEVIR-MCI
+    num_semantic_classes=7,           # SECOND-CC after-change classes
+    num_change_classes=3,             # LEVIR-MCI classes
 
-    # v3.0 Dual Head
-    dual_head=True,
-    share_decoder=True,
-    use_transition_attention=True,
-
-    # v3.0 Loss
-    use_focal_loss=True,
-    focal_gamma=2.0,
-    sem_A_weight=1.0,
-    sem_B_weight=1.0,
+    # Caption
+    vocab_size=10000,
+    max_caption_length=50,
 )
 ```
 
-## Memory Optimization
+## Alignment Types
 
-The model supports several memory optimization techniques:
+| Type | Description | Best For |
+|------|-------------|----------|
+| `cross_attention` | Query from t1, Key/Value from t0 | General use, best quality |
+| `deformable` | Learnable spatial offsets | Large misalignments |
+| `hierarchical` | Multi-scale alignment | Multi-resolution changes |
+
+## Performance Optimization
 
 | Technique | Effect | Trade-off |
 |-----------|--------|-----------|
 | Gradient Accumulation | Simulate larger batch | None |
 | Gradient Checkpointing | ~40% memory reduction | ~20% slower |
 | Mixed Precision (AMP) | ~50% memory reduction | Minimal |
+| cuDNN Benchmark | Faster convolutions | First batch slower |
+| Persistent Workers | Faster data loading | Higher memory |
 
 Adjust `batch_size` and `gradient_accumulation_steps` in config based on available memory.
 

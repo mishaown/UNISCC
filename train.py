@@ -39,14 +39,15 @@ from losses import CaptionLoss
 from utils import MultiClassChangeMetrics, CaptionMetrics
 
 
-def set_seed(seed: int):
+def set_seed(seed: int, benchmark: bool = True):
     """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # Enable cuDNN benchmark for faster convolutions (small variability in results)
+    torch.backends.cudnn.benchmark = benchmark
+    torch.backends.cudnn.deterministic = not benchmark
 
 
 def load_config(config_path: str) -> dict:
@@ -179,12 +180,13 @@ class DualSemanticCDLoss(nn.Module):
 
 class Trainer:
     """
-    UniSCC Trainer with Shared Semantic Space.
+    UniSCC Trainer v4.0 with Feature Alignment.
 
-    v3.0: Supports dual semantic head training with:
-    - Separate losses for sem_A and sem_B
-    - Focal loss for class imbalance
-    - Transition-aware caption generation
+    Features:
+    - Bitemporal feature alignment for accurate change detection
+    - Single semantic head (after-change prediction)
+    - Shared semantic space between CD and captioning
+    - Support for both SECOND-CC and LEVIR-MCI datasets
 
     Handles training loop, validation, checkpointing, and logging.
     """
@@ -200,17 +202,20 @@ class Trainer:
         self.is_levir = self.dataset_name == 'LEVIR-MCI'
         self.num_classes = config['dataset']['num_classes']
 
-        # v3.0: Check if dual head mode is enabled
-        self.dual_head = config.get('model', {}).get('dual_head', True)
+        # v4.0: Check alignment settings
+        model_config = config.get('model', {})
+        self.use_alignment = model_config.get('use_alignment', True)
+        self.alignment_type = model_config.get('alignment_type', 'cross_attention')
 
         print(f"\n{'='*60}")
-        print(f"UniSCC Training - {self.dataset_name}")
+        print(f"UniSCC v4.0 Training - {self.dataset_name}")
         print(f"Device: {self.device}")
-        print(f"Architecture: {'v3.0 Dual Semantic Head' if self.dual_head else 'Shared Semantic Space'}")
+        print(f"Architecture: Aligned Single Semantic Head")
+        print(f"Alignment: {self.alignment_type if self.use_alignment else 'Disabled'}")
         if self.is_levir:
-            print(f"Task: {self.num_classes}-class Semantic Change Detection + Captioning")
+            print(f"Task: {self.num_classes}-class Change Detection + Captioning")
         else:
-            print(f"Task: {self.num_classes}-class Semantic Detection (A+B) + Captioning")
+            print(f"Task: {self.num_classes}-class Semantic CD + Captioning")
         print(f"{'='*60}\n")
 
         # Setup components
@@ -258,13 +263,10 @@ class Trainer:
             num_semantic_classes=self.num_classes if not self.is_levir else 7,
             num_change_classes=self.num_classes if self.is_levir else 3,
             max_caption_length=self.config['dataset'].get('max_caption_length', 50),
-            # v3.0 config
-            dual_head=self.dual_head,
-            share_decoder=model_config.get('share_decoder', True),
-            transition_hidden_dim=model_config.get('transition_hidden_dim', 256),
-            use_transition_attention=model_config.get('use_transition_attention', True),
-            use_focal_loss=model_config.get('use_focal_loss', True),
-            focal_gamma=model_config.get('focal_gamma', 2.0),
+            # v4.0 config - alignment
+            use_alignment=self.use_alignment,
+            alignment_type=self.alignment_type,
+            alignment_heads=model_config.get('alignment_heads', 8),
         )
         self.model = UniSCC(config).to(self.device)
 
@@ -273,7 +275,7 @@ class Trainer:
         num_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"  Parameters: {num_params:,}")
         print(f"  Trainable: {num_trainable:,}")
-        print(f"  Dual Head: {self.dual_head}")
+        print(f"  Alignment: {self.alignment_type if self.use_alignment else 'Disabled'}")
 
         # Enable gradient checkpointing if configured
         if self.config['training'].get('gradient_checkpointing', False):
@@ -286,31 +288,13 @@ class Trainer:
 
         print(f"  CD classes: {self.num_classes}")
 
-        # v3.0: Use dual semantic loss for dual head mode
-        if self.dual_head:
-            # Get class weights if specified
-            class_weights = loss_config.get('class_weights', None)
-            if class_weights is not None:
-                class_weights = torch.tensor(class_weights, dtype=torch.float32)
-
-            self.cd_loss = DualSemanticCDLoss(
-                num_classes=self.num_classes,
-                ignore_index=loss_config.get('scd_loss', {}).get('ignore_index', 255),
-                label_smoothing=0.1,
-                class_weights=class_weights,
-                use_focal=loss_config.get('use_focal_loss', True),
-                focal_gamma=loss_config.get('focal_gamma', 2.0),
-                sem_A_weight=loss_config.get('sem_A_weight', 1.0),
-                sem_B_weight=loss_config.get('sem_B_weight', 1.0)
-            ).to(self.device)
-            print(f"  Loss type: DualSemanticCDLoss (focal={loss_config.get('use_focal_loss', True)})")
-        else:
-            # Legacy single head loss
-            self.cd_loss = SemanticCDLoss(
-                num_classes=self.num_classes,
-                ignore_index=loss_config.get('scd_loss', {}).get('ignore_index', 255),
-                label_smoothing=0.1
-            ).to(self.device)
+        # v4.0: Single semantic head loss (after-change prediction)
+        self.cd_loss = SemanticCDLoss(
+            num_classes=self.num_classes,
+            ignore_index=loss_config.get('scd_loss', {}).get('ignore_index', 255),
+            label_smoothing=0.1
+        ).to(self.device)
+        print(f"  Loss type: SemanticCDLoss (single head)")
 
         # Caption loss
         cap_config = loss_config.get('caption_loss', {})
@@ -372,20 +356,14 @@ class Trainer:
         self,
         outputs: Dict[str, torch.Tensor],
         targets: torch.Tensor,
-        captions: torch.Tensor,
-        target_A: Optional[torch.Tensor] = None
+        captions: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute total loss."""
         loss_dict = {}
 
-        # v3.0: Dual head loss
-        if self.dual_head:
-            cd_loss, cd_loss_dict = self.cd_loss(outputs, target_A, targets)
-        else:
-            # Legacy: single target
-            cd_logits = outputs['cd_logits']
-            cd_loss, cd_loss_dict = self.cd_loss(cd_logits, targets)
-
+        # v4.0: Single semantic head loss (after-change only)
+        cd_logits = outputs['cd_logits']
+        cd_loss, cd_loss_dict = self.cd_loss(cd_logits, targets)
         loss_dict.update(cd_loss_dict)
 
         # Caption loss
@@ -413,10 +391,6 @@ class Trainer:
         self.model.train()
 
         epoch_losses = {'total': 0, 'cd': 0, 'caption': 0}
-        if self.dual_head:
-            epoch_losses['sem_A'] = 0
-            epoch_losses['sem_B'] = 0
-
         num_batches = len(self.train_loader)
 
         # Gradient accumulation settings
@@ -426,27 +400,24 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch+1}")
 
         for batch_idx, batch in enumerate(pbar):
-            # Move to device
-            rgb_a = batch['rgb_a'].to(self.device)
-            rgb_b = batch['rgb_b'].to(self.device)
+            # Move to device with non_blocking for async transfer
+            rgb_a = batch['rgb_a'].to(self.device, non_blocking=True)
+            rgb_b = batch['rgb_b'].to(self.device, non_blocking=True)
 
-            # Get targets
-            # v3.0: Need both sem_a and sem_b for dual head
+            # Get targets (after-change semantic map)
             if self.is_levir:
-                targets = batch['label'].to(self.device)
-                target_A = None  # LEVIR-MCI doesn't have sem_a
+                targets = batch['label'].to(self.device, non_blocking=True)
             else:
-                targets = batch['sem_b'].to(self.device)  # sem_B target
-                target_A = batch['sem_a'].to(self.device) if 'sem_a' in batch else targets
+                targets = batch['sem_b'].to(self.device, non_blocking=True)
 
-            captions = batch['captions'][:, 0].to(self.device)
-            lengths = batch['caption_lengths'][:, 0].to(self.device)
+            captions = batch['captions'][:, 0].to(self.device, non_blocking=True)
+            lengths = batch['caption_lengths'][:, 0].to(self.device, non_blocking=True)
 
             # Forward with gradient accumulation
             if self.use_amp:
                 with autocast():
                     outputs = self.model(rgb_a, rgb_b, captions, lengths)
-                    loss, loss_dict = self._compute_loss(outputs, targets, captions, target_A)
+                    loss, loss_dict = self._compute_loss(outputs, targets, captions)
                     # Scale loss for gradient accumulation
                     loss = loss / accum_steps
 
@@ -467,7 +438,7 @@ class Trainer:
                     self.optimizer.zero_grad()
             else:
                 outputs = self.model(rgb_a, rgb_b, captions, lengths)
-                loss, loss_dict = self._compute_loss(outputs, targets, captions, target_A)
+                loss, loss_dict = self._compute_loss(outputs, targets, captions)
                 # Scale loss for gradient accumulation
                 loss = loss / accum_steps
 
@@ -496,18 +467,14 @@ class Trainer:
                 'cd': f"{loss_dict.get('cd', 0):.4f}",
                 'cap': f"{loss_dict.get('caption', 0):.4f}"
             }
-            if self.dual_head and 'sem_A' in loss_dict:
-                postfix['sA'] = f"{loss_dict.get('sem_A', 0):.4f}"
-                postfix['sB'] = f"{loss_dict.get('sem_B', 0):.4f}"
             pbar.set_postfix(postfix)
 
             # Log to tensorboard
             if self.writer and batch_idx % 50 == 0:
                 self.writer.add_scalar('train/loss', loss_dict['total'], self.global_step)
+                self.writer.add_scalar('train/cd_loss', loss_dict.get('cd', 0), self.global_step)
+                self.writer.add_scalar('train/cap_loss', loss_dict.get('caption', 0), self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
-                if self.dual_head:
-                    self.writer.add_scalar('train/sem_A', loss_dict.get('sem_A', 0), self.global_step)
-                    self.writer.add_scalar('train/sem_B', loss_dict.get('sem_B', 0), self.global_step)
 
             # Periodic cache clearing for memory optimization
             if empty_cache_freq > 0 and (batch_idx + 1) % empty_cache_freq == 0:
@@ -525,64 +492,41 @@ class Trainer:
         self.model.eval()
 
         val_losses = {'total': 0, 'cd': 0, 'caption': 0}
-        if self.dual_head:
-            val_losses['sem_A'] = 0
-            val_losses['sem_B'] = 0
 
         # Metrics
-        cd_metrics_B = MultiClassChangeMetrics(self.num_classes)
-        if self.dual_head:
-            cd_metrics_A = MultiClassChangeMetrics(self.num_classes)
+        cd_metrics = MultiClassChangeMetrics(self.num_classes)
 
         for batch in tqdm(self.val_loader, desc="Validating"):
-            rgb_a = batch['rgb_a'].to(self.device)
-            rgb_b = batch['rgb_b'].to(self.device)
+            rgb_a = batch['rgb_a'].to(self.device, non_blocking=True)
+            rgb_b = batch['rgb_b'].to(self.device, non_blocking=True)
 
-            # Get targets
+            # Get targets (after-change semantic map)
             if self.is_levir:
-                targets = batch['label'].to(self.device)
-                target_A = None
+                targets = batch['label'].to(self.device, non_blocking=True)
             else:
-                targets = batch['sem_b'].to(self.device)
-                target_A = batch['sem_a'].to(self.device) if 'sem_a' in batch else targets
+                targets = batch['sem_b'].to(self.device, non_blocking=True)
 
-            captions = batch['captions'][:, 0].to(self.device)
+            captions = batch['captions'][:, 0].to(self.device, non_blocking=True)
             lengths = batch['caption_lengths'][:, 0].to(self.device)
 
             # Use force_teacher_forcing=True to compute caption loss during validation
             outputs = self.model(rgb_a, rgb_b, captions, lengths, force_teacher_forcing=True)
-            _, loss_dict = self._compute_loss(outputs, targets, captions, target_A)
+            _, loss_dict = self._compute_loss(outputs, targets, captions)
 
             for k, v in loss_dict.items():
                 val_losses[k] = val_losses.get(k, 0) + v
 
-            # Update metrics
-            if self.dual_head and 'sem_B_logits' in outputs:
-                # v3.0: Metrics for both A and B
-                pred_B = outputs['sem_B_logits'].argmax(dim=1)
-                cd_metrics_B.update(pred_B.cpu(), targets.cpu())
-
-                if target_A is not None and 'sem_A_logits' in outputs:
-                    pred_A = outputs['sem_A_logits'].argmax(dim=1)
-                    cd_metrics_A.update(pred_A.cpu(), target_A.cpu())
-            else:
-                # Legacy
-                cd_preds = outputs['cd_logits'].argmax(dim=1)
-                cd_metrics_B.update(cd_preds.cpu(), targets.cpu())
+            # Update CD metrics
+            pred = outputs['cd_logits'].argmax(dim=1)
+            cd_metrics.update(pred.cpu(), targets.cpu())
 
         # Average losses
         for k in val_losses:
             val_losses[k] /= len(self.val_loader)
 
         # Compute metrics
-        metrics_B = cd_metrics_B.compute()
-        val_losses.update(metrics_B)
-
-        # v3.0: Add metrics for sem_A
-        if self.dual_head and not self.is_levir:
-            metrics_A = cd_metrics_A.compute()
-            val_losses['mIoU_A'] = metrics_A.get('mIoU', 0)
-            val_losses['F1_A'] = metrics_A.get('F1', 0)
+        metrics = cd_metrics.compute()
+        val_losses.update(metrics)
 
         return val_losses
 

@@ -253,6 +253,9 @@ def create_levirmci_dataloaders(
         max_caption_length=max_caption_length
     )
     
+    # Use persistent_workers for faster data loading (avoids worker restart overhead)
+    use_persistent = num_workers > 0
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -260,25 +263,31 @@ def create_levirmci_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=LEVIRMCIDataset.collate_fn,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=LEVIRMCIDataset.collate_fn
+        collate_fn=LEVIRMCIDataset.collate_fn,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
-    
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=LEVIRMCIDataset.collate_fn
+        collate_fn=LEVIRMCIDataset.collate_fn,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     return train_loader, val_loader, test_loader, vocab
