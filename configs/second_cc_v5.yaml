@@ -1,0 +1,225 @@
+# UniSCC v5.0 Configuration for SECOND-CC Dataset
+# Multi-Scale Semantic Change Detection + Change Captioning
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+dataset:
+  name: "SECOND-CC"
+  root: "E:/CD-Experiment/Datasets/SECOND-CC-AUG"
+
+  train_split: "train"
+  val_split: "val"
+  test_split: "test"
+
+  image_size: 256
+  num_channels: 3
+
+  # 7 after-change semantic classes for SCD
+  num_classes: 7
+  class_names:
+    - "background"        # 0: unchanged background/no_change
+    - "low_vegetation"    # 1
+    - "non_vegetated_ground"  # 2
+    - "tree"              # 3
+    - "water"             # 4
+    - "building"          # 5
+    - "playground"        # 6
+
+  # Caption settings
+  max_caption_length: 50
+  min_word_freq: 5
+  vocab_size: 10000
+  num_captions_per_image: 5
+
+# =============================================================================
+# Model Configuration (v5.0)
+# =============================================================================
+model:
+  name: "UniSCC_v5"
+  version: "5.0"
+
+  # Multi-scale architecture
+  use_pyramid: true
+  pyramid_channels: 256
+  num_scales: 4
+
+  encoder:
+    backbone: "swin_base_patch4_window7_224"
+    pretrained: "imagenet22k"
+    output_pyramid: true  # v5.0: Enable multi-scale output
+
+  # Hierarchical alignment
+  alignment:
+    type: "hierarchical"
+    num_heads: 8
+    use_skip_connections: true
+    dropout: 0.1
+
+  # Multi-scale TDT
+  tdt:
+    num_layers: 2  # Per-scale layers
+    num_heads: 8
+    output_dim: 512
+    dropout: 0.1
+
+  # Change-aware attention
+  change_attention:
+    reduction: 16
+
+  # Hierarchical semantic prompts
+  lsp:
+    num_classes: 7
+    prompt_dim: 256
+    num_scales: 4
+    learnable: true
+
+  # Multi-task CD head
+  cd_head:
+    in_channels: 512
+    hidden_channels: 256
+    num_classes: 7
+    use_magnitude: true
+
+  # Multi-level caption decoder
+  caption_decoder:
+    num_layers: 6
+    num_heads: 8
+    hidden_dim: 512
+    ffn_dim: 2048
+    vocab_size: 10000
+    max_length: 50
+    dropout: 0.1
+    num_scales: 4
+
+# =============================================================================
+# Loss Configuration (v5.0)
+# =============================================================================
+loss:
+  scd_weight: 1.0
+  caption_weight: 1.0
+  magnitude_weight: 0.5
+  boundary_weight: 0.0  # Enable during fine-tuning
+
+  scd_loss:
+    type: "multi_task"  # v5.0: Multi-task loss
+    use_focal: true
+    focal_gamma: 2.0
+    ignore_index: 255
+
+  magnitude_loss:
+    enabled: true
+    weight: 0.5
+
+  caption_loss:
+    type: "cross_entropy"
+    label_smoothing: 0.1
+    ignore_index: 0
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  batch_size: 2                    # Reduced for v5.0 (more params)
+  gradient_accumulation_steps: 6   # Effective batch size = 2 * 6 = 12
+  num_epochs: 50
+
+  # Training phases
+  phases:
+    warmup:
+      epochs: 5
+      freeze_encoder: true
+      lr: 1.0e-3
+    joint:
+      epochs: 40
+      lr: 5.0e-5
+    finetune:
+      epochs: 5
+      lr: 1.0e-6
+      use_boundary_loss: true
+
+  optimizer:
+    type: "AdamW"
+    lr: 5.0e-5
+    weight_decay: 0.01
+
+  scheduler:
+    type: "CosineAnnealingWarmRestarts"
+    T_0: 10
+    T_mult: 2
+    eta_min: 1.0e-7
+
+  warmup_epochs: 5
+  gradient_clip: 0.5
+
+  amp:
+    enabled: true
+
+  gradient_checkpointing: true    # Required for v5.0 due to larger model
+  empty_cache_freq: 100
+
+# =============================================================================
+# Augmentation
+# =============================================================================
+augmentation:
+  train:
+    horizontal_flip: 0.5
+    vertical_flip: 0.5
+    rotation: 0.3
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.05
+      p: 0.3
+    gaussian_blur: 0.2
+
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  batch_size: 2
+  beam_size: 5
+
+  # v5.0: Extended metrics
+  cd_metrics: ["mIoU", "F1", "OA", "boundary_IoU"]
+  caption_metrics: ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"]
+  magnitude_metrics: ["MSE", "MAE"]
+
+# =============================================================================
+# Checkpointing & Logging
+# =============================================================================
+checkpoint:
+  save_dir: "./checkpoints/second_cc_v5"
+  save_every: 5
+  monitor: "val_mIoU"
+  save_best: true
+
+logging:
+  log_dir: "./logs/second_cc_v5"
+  log_every: 50
+  use_tensorboard: true
+  log_scale_weights: true  # v5.0: Monitor scale fusion weights
+  log_attention_maps: true  # v5.0: Visualize change attention
+
+# =============================================================================
+# Hardware
+# =============================================================================
+hardware:
+  device: "cuda"
+  gpu_ids: [0]
+
+seed: 42
+
+# =============================================================================
+# v5.0 Monitoring
+# =============================================================================
+monitoring:
+  track_scale_weights: true
+  track_alignment_confidence: true
+  track_change_attention: true
+  visualize_pyramids: false  # Enable for debugging

@@ -217,13 +217,22 @@ def plot_comprehensive_summary(
     # Training Loss (top-left, spans 2 columns)
     ax1 = fig.add_subplot(gs[0, :2])
     if 'train/loss' in metrics:
-        data = metrics['train/loss']
-        ax1.plot(data['steps'], data['values'], 'b-', linewidth=1, alpha=0.7, label='Train')
+        train_data = metrics['train/loss']
+        ax1.plot(train_data['steps'], train_data['values'], 'b-', linewidth=1, alpha=0.7, label='Train')
     if 'val/loss' in metrics:
-        data = metrics['val/loss']
-        # Convert epochs to approximate steps for overlay
+        val_data = metrics['val/loss']
+        # Convert validation epochs to approximate steps for proper overlay
+        # Estimate steps per epoch from training data
+        if 'train/loss' in metrics and len(train_data['steps']) > 1 and len(val_data['steps']) > 1:
+            max_train_step = train_data['steps'][-1]
+            num_epochs = len(val_data['steps'])
+            steps_per_epoch = max_train_step / max(num_epochs, 1)
+            # Scale validation epochs to training steps
+            val_steps_scaled = val_data['steps'] * steps_per_epoch
+        else:
+            val_steps_scaled = val_data['steps']
         ax1_twin = ax1.twinx()
-        ax1_twin.plot(data['steps'], data['values'], 'r-', linewidth=2, marker='o', markersize=4, label='Val')
+        ax1_twin.plot(val_steps_scaled, val_data['values'], 'r-', linewidth=2, marker='o', markersize=4, label='Val')
         ax1_twin.set_ylabel('Val Loss', color='r', fontsize=10)
         ax1_twin.tick_params(axis='y', labelcolor='r')
     ax1.set_xlabel('Step', fontsize=10)

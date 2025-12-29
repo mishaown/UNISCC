@@ -3,11 +3,13 @@ Vision Encoder for UniSCC
 Implements Siamese encoder with temporal embeddings
 
 v3.0: Added gradient checkpointing support for memory optimization
+v5.0: Added multi-scale pyramid output for FPN architecture
 """
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+from typing import Dict, List, Union
 
 try:
     import timm
@@ -80,6 +82,7 @@ class UniSCCEncoder(nn.Module):
     Extracts features with shared weights and temporal embeddings
 
     v3.0: Added gradient checkpointing for memory optimization
+    v5.0: Added multi-scale pyramid output for FPN architecture
     """
 
     def __init__(
@@ -88,39 +91,45 @@ class UniSCCEncoder(nn.Module):
         pretrained: bool = True,
         feature_dim: int = 512,
         img_size: int = 256,
-        use_temporal_embed: bool = True
+        use_temporal_embed: bool = True,
+        output_pyramid: bool = False  # v5.0: Enable multi-scale output
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.use_temporal_embed = use_temporal_embed
+        self.output_pyramid = output_pyramid
         self.gradient_checkpointing = False  # Can be enabled for memory saving
 
         # Build backbone
         if TIMM_AVAILABLE and "swin" in backbone.lower():
+            # v5.0: Get all stages for pyramid output
+            out_indices = [0, 1, 2, 3] if output_pyramid else [3]
             self.backbone = timm.create_model(
                 backbone,
                 pretrained=pretrained,
                 features_only=True,
                 img_size=img_size,
-                out_indices=[3]  # Only get last stage
+                out_indices=out_indices
             )
-            # Get output channels from last stage
-            backbone_channels = self.backbone.feature_info.channels()[-1]
+            # Get output channels from all stages
+            self.backbone_channels = self.backbone.feature_info.channels()
+            backbone_channels = self.backbone_channels[-1]
             self.use_timm = True
         else:
             print(f"Using simple ResNet backbone (timm not available)")
             self.backbone = SimpleResNetBackbone(feature_dim)
+            self.backbone_channels = [feature_dim]
             backbone_channels = feature_dim
             self.use_timm = False
 
-        # Project to feature_dim if needed
-        if backbone_channels != feature_dim:
+        # Project to feature_dim if needed (only for single-scale mode)
+        if not output_pyramid and backbone_channels != feature_dim:
             self.proj = nn.Conv2d(backbone_channels, feature_dim, 1)
         else:
             self.proj = nn.Identity()
 
-        # Temporal embeddings
-        if use_temporal_embed:
+        # Temporal embeddings (only for single-scale mode)
+        if use_temporal_embed and not output_pyramid:
             self.temporal_embed = TemporalEmbedding(feature_dim)
         else:
             self.temporal_embed = None
@@ -133,7 +142,7 @@ class UniSCCEncoder(nn.Module):
             self.backbone.set_grad_checkpointing(enable)
 
     def _forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward through backbone (for checkpointing)."""
+        """Forward through backbone (for checkpointing) - returns last stage."""
         if self.use_timm:
             features = self.backbone(x)
             x = features[-1]
@@ -142,6 +151,22 @@ class UniSCCEncoder(nn.Module):
         else:
             x = self.backbone(x)
         return x
+
+    def _forward_backbone_pyramid(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Forward through backbone and return ALL stages for pyramid mode."""
+        if self.use_timm:
+            features = self.backbone(x)
+            # Process each stage to ensure correct format [B, C, H, W]
+            processed = []
+            for i, feat in enumerate(features):
+                if feat.dim() == 4 and feat.shape[1] != self.backbone_channels[i]:
+                    # Convert from [B, H, W, C] to [B, C, H, W]
+                    feat = feat.permute(0, 3, 1, 2)
+                processed.append(feat)
+            return processed
+        else:
+            x = self.backbone(x)
+            return [x]
 
     def forward_single(self, x: torch.Tensor, time_idx: int):
         """Extract features from single image"""
@@ -160,7 +185,29 @@ class UniSCCEncoder(nn.Module):
 
         return x
 
-    def forward(self, img_t0: torch.Tensor, img_t1: torch.Tensor):
+    def forward_pyramid(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Extract multi-scale features for v5.0 pyramid mode.
+
+        Args:
+            x: [B, 3, H, W] input image
+
+        Returns:
+            List of features from each stage:
+                - Stage 0: [B, 128, 64, 64]
+                - Stage 1: [B, 256, 32, 32]
+                - Stage 2: [B, 512, 16, 16]
+                - Stage 3: [B, 1024, 8, 8]
+        """
+        if self.gradient_checkpointing and self.training:
+            # Checkpoint doesn't work well with returning lists, so don't use it for pyramid
+            features = self._forward_backbone_pyramid(x)
+        else:
+            features = self._forward_backbone_pyramid(x)
+
+        return features
+
+    def forward(self, img_t0: torch.Tensor, img_t1: torch.Tensor) -> Dict[str, Union[torch.Tensor, List[torch.Tensor]]]:
         """
         Forward pass for bi-temporal images
 
@@ -169,12 +216,25 @@ class UniSCCEncoder(nn.Module):
             img_t1: [B, 3, H, W] post-change image
 
         Returns:
-            dict with features_t0 and features_t1 [B, C, H', W']
-        """
-        feat_t0 = self.forward_single(img_t0, time_idx=0)
-        feat_t1 = self.forward_single(img_t1, time_idx=1)
+            v4.0 mode (output_pyramid=False):
+                dict with 'features_t0' and 'features_t1' [B, C, H', W']
 
-        return {
-            'features_t0': feat_t0,
-            'features_t1': feat_t1
-        }
+            v5.0 mode (output_pyramid=True):
+                dict with 'stages_t0' and 'stages_t1' (lists of multi-scale features)
+        """
+        if self.output_pyramid:
+            # v5.0: Return multi-scale features for FPN
+            stages_t0 = self.forward_pyramid(img_t0)
+            stages_t1 = self.forward_pyramid(img_t1)
+            return {
+                'stages_t0': stages_t0,
+                'stages_t1': stages_t1
+            }
+        else:
+            # v4.0: Return single-scale features
+            feat_t0 = self.forward_single(img_t0, time_idx=0)
+            feat_t1 = self.forward_single(img_t1, time_idx=1)
+            return {
+                'features_t0': feat_t0,
+                'features_t1': feat_t1
+            }
