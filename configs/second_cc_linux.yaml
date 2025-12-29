@@ -1,4 +1,4 @@
-# UniSCC v5.0 Configuration for SECOND-CC Dataset
+# UniSCC v5.0 Configuration for SECOND-CC Dataset (Linux)
 # Multi-Scale Semantic Change Detection + Change Captioning
 
 # =============================================================================
@@ -6,7 +6,7 @@
 # =============================================================================
 dataset:
   name: "SECOND-CC"
-  root: "E:/CD-Experiment/Datasets/SECOND-CC-AUG"
+  root: "/home/user1/ms/Datasets/SECOND-CC-AUG"
 
   train_split: "train"
   val_split: "val"
@@ -123,20 +123,7 @@ training:
   batch_size: 2                    # Reduced for v5.0 (more params)
   gradient_accumulation_steps: 6   # Effective batch size = 2 * 6 = 12
   num_epochs: 50
-
-  # Training phases
-  phases:
-    warmup:
-      epochs: 5
-      freeze_encoder: true
-      lr: 1.0e-3
-    joint:
-      epochs: 40
-      lr: 5.0e-5
-    finetune:
-      epochs: 5
-      lr: 1.0e-6
-      use_boundary_loss: true
+  num_workers: 8
 
   optimizer:
     type: "AdamW"
@@ -185,7 +172,6 @@ evaluation:
   batch_size: 2
   beam_size: 5
 
-  # v5.0: Extended metrics
   cd_metrics: ["mIoU", "F1", "OA", "boundary_IoU"]
   caption_metrics: ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"]
   magnitude_metrics: ["MSE", "MAE"]
@@ -194,17 +180,17 @@ evaluation:
 # Checkpointing & Logging
 # =============================================================================
 checkpoint:
-  save_dir: "./checkpoints/second_cc_v5"
+  save_dir: "./checkpoints/second_cc"
   save_every: 5
   monitor: "val_mIoU"
   save_best: true
 
 logging:
-  log_dir: "./logs/second_cc_v5"
+  log_dir: "./logs/second_cc"
   log_every: 50
   use_tensorboard: true
-  log_scale_weights: true  # v5.0: Monitor scale fusion weights
-  log_attention_maps: true  # v5.0: Visualize change attention
+  log_scale_weights: true
+  log_attention_maps: true
 
 # =============================================================================
 # Hardware
@@ -214,12 +200,3 @@ hardware:
   gpu_ids: [0]
 
 seed: 42
-
-# =============================================================================
-# v5.0 Monitoring
-# =============================================================================
-monitoring:
-  track_scale_weights: true
-  track_alignment_confidence: true
-  track_change_attention: true
-  visualize_pyramids: false  # Enable for debugging

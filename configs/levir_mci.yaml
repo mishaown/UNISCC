@@ -1,5 +1,5 @@
-# UniSCC Configuration for LEVIR-MCI Dataset
-# Multi-class Change Detection + Change Captioning
+# UniSCC v5.0 Configuration for LEVIR-MCI Dataset
+# Multi-Scale Change Detection + Change Captioning
 
 # =============================================================================
 # Dataset Configuration
@@ -17,14 +17,12 @@ dataset:
   spatial_resolution: 0.5  # meters per pixel
 
   # 3-class semantic change detection
-  # Uses label_rgb for after-change semantics (what the area became after change)
-  # Color mapping: (0,0,0) -> no_change, (255,0,0) -> building, (0,0,255) -> road
   num_classes: 3
   class_names:
     - "no_change"   # 0: no change detected (black)
     - "building"    # 1: building (red)
     - "road"        # 2: road (blue)
-  
+
   # Caption settings
   max_caption_length: 50
   min_word_freq: 5
@@ -32,62 +30,84 @@ dataset:
   num_captions_per_image: 5
 
 # =============================================================================
-# Model Configuration
+# Model Configuration (v5.0)
 # =============================================================================
 model:
-  name: "UniSCC"
+  name: "UniSCC_v5"
+  version: "5.0"
 
-  # v4.0: Feature alignment for bitemporal images
-  use_alignment: true
-  alignment_type: "cross_attention"  # cross_attention, deformable, hierarchical
-  alignment_heads: 8
+  # Multi-scale architecture
+  use_pyramid: true
+  pyramid_channels: 256
+  num_scales: 4
 
   encoder:
     backbone: "swin_base_patch4_window7_224"
     pretrained: "imagenet22k"
-    feature_dim: 1024
+    output_pyramid: true  # v5.0: Enable multi-scale output
 
-  tdt:  # Temporal Difference Transformer
-    num_layers: 3
+  # Hierarchical alignment
+  alignment:
+    type: "hierarchical"
     num_heads: 8
-    hidden_dim: 512
+    use_skip_connections: true
     dropout: 0.1
 
-  lsp:  # Learnable Semantic Prompts
+  # Multi-scale TDT
+  tdt:
+    num_layers: 2  # Per-scale layers
+    num_heads: 8
+    output_dim: 512
+    dropout: 0.1
+
+  # Change-aware attention
+  change_attention:
+    reduction: 16
+
+  # Hierarchical semantic prompts
+  lsp:
     num_classes: 3
-    prompt_dim: 512
-    num_prompts_per_class: 4
-    dropout: 0.1
+    prompt_dim: 256
+    num_scales: 4
+    learnable: true
 
-  scd_head:
+  # Multi-task CD head
+  cd_head:
     in_channels: 512
     hidden_channels: 256
     num_classes: 3
-    use_batch_norm: true
+    use_magnitude: true
 
+  # Multi-level caption decoder
   caption_decoder:
     num_layers: 6
     num_heads: 8
     hidden_dim: 512
+    ffn_dim: 2048
     vocab_size: 10000
     max_length: 50
     dropout: 0.1
+    num_scales: 4
 
 # =============================================================================
-# Loss Configuration
+# Loss Configuration (v5.0)
 # =============================================================================
 loss:
   scd_weight: 1.0
   caption_weight: 1.0
-  consistency_weight: 0.5
-  
+  magnitude_weight: 0.5
+  boundary_weight: 0.0  # Enable during fine-tuning
+
   scd_loss:
-    type: "combined"
-    use_bce: false
+    type: "multi_task"  # v5.0: Multi-task loss
+    use_focal: true
     focal_gamma: 2.0
-    dice_smooth: 1.0
     ignore_index: 255
-  
+
+  magnitude_loss:
+    enabled: true
+    weight: 0.5
+
   caption_loss:
     type: "cross_entropy"
     label_smoothing: 0.1
@@ -97,33 +117,30 @@ loss:
 # Training Configuration
 # =============================================================================
 training:
-  batch_size: 4                    # Reduced from 12 for memory
-  gradient_accumulation_steps: 3   # Effective batch size = 4 * 3 = 12
-  num_epochs: 10
-  num_workers: 8                   # Increased for better data loading throughput
+  batch_size: 2                    # Reduced for v5.0 (more params)
+  gradient_accumulation_steps: 6   # Effective batch size = 2 * 6 = 12
+  num_epochs: 50
+  num_workers: 8
 
   optimizer:
     type: "AdamW"
-    lr: 1.0e-4
+    lr: 5.0e-5
     weight_decay: 0.01
 
   scheduler:
     type: "CosineAnnealingWarmRestarts"
-    T_0: 5
+    T_0: 10
     T_mult: 2
-    eta_min: 1.0e-6
+    eta_min: 1.0e-7
 
-  warmup_epochs: 2
-  gradient_clip: 1.0
+  warmup_epochs: 5
+  gradient_clip: 0.5
 
   amp:
     enabled: true
 
-  # Speed vs Memory tradeoff
-  # Set gradient_checkpointing: false for ~25% faster training (needs more VRAM)
-  # Set gradient_checkpointing: true for lower memory usage (slower)
-  gradient_checkpointing: false    # Disabled for speed (enable if OOM)
-  empty_cache_freq: 0              # Disabled - causes slowdown (set >0 only if needed)
+  gradient_checkpointing: true    # Required for v5.0 due to larger model
+  empty_cache_freq: 100
 
 # =============================================================================
 # Augmentation
@@ -140,7 +157,7 @@ augmentation:
       hue: 0.05
       p: 0.3
     gaussian_blur: 0.2
-  
+
   # LEVIR-MCI specific normalization
   normalize:
     mean: [0.39073, 0.38623, 0.32989]
@@ -150,12 +167,12 @@ augmentation:
 # Evaluation
 # =============================================================================
 evaluation:
-  batch_size: 4   # Match training batch size for memory
+  batch_size: 2
   beam_size: 5
 
-  # Semantic CD metrics (3-class: no_change, building, road)
-  cd_metrics: ["mIoU", "F1", "OA"]
+  cd_metrics: ["mIoU", "F1", "OA", "boundary_IoU"]
   caption_metrics: ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"]
+  magnitude_metrics: ["MSE", "MAE"]
 
 # =============================================================================
 # Checkpointing & Logging
@@ -163,12 +180,15 @@ evaluation:
 checkpoint:
   save_dir: "./checkpoints/levir_mci"
   save_every: 5
-  monitor: "val_F1"
+  monitor: "val_mIoU"
+  save_best: true
 
 logging:
   log_dir: "./logs/levir_mci"
   log_every: 50
   use_tensorboard: true
+  log_scale_weights: true
+  log_attention_maps: true
 
 # =============================================================================
 # Hardware
