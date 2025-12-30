@@ -133,13 +133,29 @@ class Inferencer:
         # Determine dataset type
         dataset_type = 'levir_mci' if self.is_levir else 'second_cc'
 
+        # Load checkpoint first to extract vocab_size
+        vocab_size = len(self.vocab)  # Default fallback
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            # Extract vocab_size from checkpoint weights
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                # Check caption decoder embedding layer shape
+                embed_key = 'caption_decoder.token_embed.weight'
+                if embed_key in state_dict:
+                    vocab_size = state_dict[embed_key].shape[0]
+                    print(f"Detected vocab_size from checkpoint: {vocab_size}")
+        else:
+            checkpoint = None
+            print(f"Warning: Checkpoint not found, using random weights")
+
         # Build model using v5.0 config with multi-scale architecture
         model_cfg = self.config.get('model', {})
         config = UniSCCConfig(
             dataset=dataset_type,
             backbone=model_cfg.get('encoder', {}).get('backbone', 'swin_base_patch4_window7_224'),
             feature_dim=model_cfg.get('tdt', {}).get('hidden_dim', 512),
-            vocab_size=len(self.vocab),
+            vocab_size=vocab_size,
             num_semantic_classes=self.num_classes if not self.is_levir else 7,
             num_change_classes=self.num_classes if self.is_levir else 3,
             max_caption_length=self.config['dataset'].get('max_caption_length', 50),
@@ -150,17 +166,15 @@ class Inferencer:
         )
         self.model = UniSCC(config).to(self.device)
 
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if checkpoint is not None:
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded checkpoint: {checkpoint_path}")
             print(f"  Epoch: {checkpoint.get('epoch', 'N/A')}")
-        else:
-            print(f"Warning: Checkpoint not found, using random weights")
 
         self.model.eval()
         print(f"  Alignment: {config.alignment_type if config.use_alignment else 'Disabled'}")
         print(f"  Classes: {self.num_classes}")
+        print(f"  Vocab size: {vocab_size}")
 
     @torch.no_grad()
     def predict(self, image_a: Image.Image, image_b: Image.Image) -> Dict[str, Any]:
