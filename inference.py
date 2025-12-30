@@ -2,43 +2,44 @@
 """
 UniSCC Inference Script (v5.0)
 
-Run inference on single image pairs or directories with multi-scale architecture.
-
-v5.0 Features:
-- Multi-scale hierarchical architecture with FPN
-- Hierarchical feature alignment across scales
-- Multi-task change detection head with magnitude estimation
-- Multi-level caption decoder
+Run inference on image pairs with multi-scale architecture.
+By default, randomly selects samples from the dataset path specified in config.
 
 Outputs:
-- change_map.npy: Semantic change map
-- caption.txt: Generated change caption
-- viz.png: Visualization with all outputs
+- {name}_change_map.npy: Semantic change map
+- {name}_caption.txt: Generated change caption
+- {name}_viz.png: Visualization with all outputs
 
 Usage:
+    # Default: Random 10 samples from test split (uses dataset path from config)
+    python inference.py --config configs/levir_mci.yaml \
+                        --checkpoint checkpoints/levir_mci/best.pth
+
+    # Random N samples with seed for reproducibility
+    python inference.py --config configs/second_cc.yaml \
+                        --checkpoint checkpoints/second_cc/best.pth \
+                        --num_samples 20 --seed 42
+
+    # Use different split (train/val/test)
+    python inference.py --config configs/levir_mci.yaml \
+                        --checkpoint checkpoints/levir_mci/best.pth \
+                        --split val --num_samples 5
+
     # Single image pair
     python inference.py --config configs/second_cc.yaml \
-                        --checkpoint checkpoints/best.pth \
+                        --checkpoint checkpoints/second_cc/best.pth \
                         --image_a path/to/before.png \
                         --image_b path/to/after.png
 
-    # Directory with separate A/B folders (SECOND-CC structure)
-    python inference.py --config configs/second_cc.yaml \
-                        --checkpoint checkpoints/best.pth \
-                        --dir_a E:/CD-Experiment/Datasets/SECOND-CC-AUG/test/rgb/A \
-                        --dir_b E:/CD-Experiment/Datasets/SECOND-CC-AUG/test/rgb/B \
-                        --output_dir outputs/
-
-    # Directory with separate A/B folders (LEVIR-MCI structure)
+    # Process all images in directories
     python inference.py --config configs/levir_mci.yaml \
-                        --checkpoint checkpoints/best.pth \
-                        --dir_a E:/CD-Experiment/Datasets/LEVIR-MCI-dataset/images/test/A \
-                        --dir_b E:/CD-Experiment/Datasets/LEVIR-MCI-dataset/images/test/B \
-                        --output_dir outputs/
+                        --checkpoint checkpoints/levir_mci/best.pth \
+                        --dir_a /path/to/A --dir_b /path/to/B
 """
 
 import os
 import argparse
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -411,27 +412,116 @@ class Inferencer:
         print(f"\nProcessed {len(results_list)} image pairs")
         return results_list
 
+    def get_dataset_dirs(self, split: str = 'test') -> Tuple[Path, Path]:
+        """Get A/B directories from config for the specified split."""
+        dataset_root = Path(self.config['dataset']['root'])
+
+        if self.is_levir:
+            # LEVIR-MCI: root/images/split/A and root/images/split/B
+            dir_a = dataset_root / 'images' / split / 'A'
+            dir_b = dataset_root / 'images' / split / 'B'
+        else:
+            # SECOND-CC: root/split/rgb/A and root/split/rgb/B
+            dir_a = dataset_root / split / 'rgb' / 'A'
+            dir_b = dataset_root / split / 'rgb' / 'B'
+
+        return dir_a, dir_b
+
+    def process_random_samples(
+        self,
+        output_dir: str,
+        num_samples: int = 10,
+        split: str = 'test',
+        seed: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process random image pairs from the dataset.
+
+        Args:
+            output_dir: Output directory for results
+            num_samples: Number of random samples to process
+            split: Dataset split to use (train/val/test)
+            seed: Random seed for reproducibility
+        """
+        if seed is not None:
+            random.seed(seed)
+
+        # Get directories from config
+        dir_a, dir_b = self.get_dataset_dirs(split)
+
+        if not dir_a.exists():
+            raise ValueError(f"Directory not found: {dir_a}")
+        if not dir_b.exists():
+            raise ValueError(f"Directory not found: {dir_b}")
+
+        # Find all images in dir_a
+        image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff']
+        images_a = []
+        for ext in image_extensions:
+            images_a.extend(dir_a.glob(ext))
+        images_a = sorted(images_a)
+
+        if not images_a:
+            print(f"Warning: No images found in {dir_a}")
+            return []
+
+        # Filter to only images that have matching B
+        valid_pairs = []
+        for img_a in images_a:
+            img_b = dir_b / img_a.name
+            if img_b.exists():
+                valid_pairs.append((img_a, img_b))
+
+        if not valid_pairs:
+            print(f"Warning: No valid image pairs found")
+            return []
+
+        # Select random samples
+        num_samples = min(num_samples, len(valid_pairs))
+        selected_pairs = random.sample(valid_pairs, num_samples)
+
+        print(f"\nDataset: {self.dataset_name}")
+        print(f"Split: {split}")
+        print(f"Total pairs available: {len(valid_pairs)}")
+        print(f"Selected {num_samples} random samples\n")
+
+        results_list = []
+        for i, (img_a_path, img_b_path) in enumerate(selected_pairs, 1):
+            name = img_a_path.stem
+            print(f"[{i}/{num_samples}] Processing: {name}")
+
+            results = self.process_pair(str(img_a_path), str(img_b_path), output_dir, name)
+            results_list.append(results)
+
+        print(f"\nProcessed {len(results_list)} image pairs")
+        print(f"Results saved to: {output_dir}")
+        return results_list
+
 
 def main():
     parser = argparse.ArgumentParser(description='UniSCC v5.0 Inference')
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
 
-    # Single image pair
+    # Random sampling mode (default) - uses dataset path from config
+    parser.add_argument('--num_samples', '-n', type=int, default=10,
+                       help='Number of random samples to process (default: 10)')
+    parser.add_argument('--split', type=str, default='test',
+                       help='Dataset split to use: train/val/test (default: test)')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed for reproducibility')
+
+    # Single image pair (overrides random sampling)
     parser.add_argument('--image_a', type=str, default=None,
                        help='Path to before image (t0)')
     parser.add_argument('--image_b', type=str, default=None,
                        help='Path to after image (t1)')
 
-    # Directory-based input (folder structure with A/ and B/ subdirs)
+    # Directory-based input (overrides random sampling)
     parser.add_argument('--dir_a', type=str, default=None,
-                       help='Directory containing before images (e.g., test/rgb/A for SECOND-CC)')
+                       help='Directory containing before images')
     parser.add_argument('--dir_b', type=str, default=None,
-                       help='Directory containing after images (e.g., test/rgb/B for SECOND-CC)')
-
-    # Legacy: pattern-based matching (deprecated)
-    parser.add_argument('--input_dir', type=str, default=None,
-                       help='[Deprecated] Use --dir_a and --dir_b instead')
+                       help='Directory containing after images')
 
     parser.add_argument('--output_dir', type=str, default='./outputs')
     args = parser.parse_args()
@@ -439,10 +529,6 @@ def main():
     # Validate input
     has_single_pair = args.image_a is not None
     has_dir_pair = args.dir_a is not None and args.dir_b is not None
-    has_legacy = args.input_dir is not None
-
-    if not (has_single_pair or has_dir_pair or has_legacy):
-        parser.error("Provide either --image_a/--image_b OR --dir_a/--dir_b")
 
     if has_single_pair and not args.image_b:
         parser.error("--image_b required with --image_a")
@@ -457,18 +543,25 @@ def main():
     inferencer = Inferencer(config, args.checkpoint)
 
     # Run inference
-    if has_dir_pair:
-        inferencer.process_directory_pair(args.dir_a, args.dir_b, args.output_dir)
-    elif has_legacy:
-        print("Warning: --input_dir is deprecated. Use --dir_a and --dir_b instead.")
-        inferencer.process_directory(args.input_dir, args.output_dir)
-    else:
+    if has_single_pair:
+        # Single image pair mode
         results = inferencer.process_pair(args.image_a, args.image_b, args.output_dir)
         print(f"\n=== v5.0 Results ===")
         print(f"Caption: {results['caption']}")
         print(f"Change map shape: {results['change_map'].shape}")
         if results.get('alignment_confidence') is not None:
             print(f"Alignment confidence: mean={results['alignment_confidence'].mean():.3f}")
+    elif has_dir_pair:
+        # Process all images in specified directories
+        inferencer.process_directory_pair(args.dir_a, args.dir_b, args.output_dir)
+    else:
+        # Default: random sampling from dataset (uses path from config)
+        inferencer.process_random_samples(
+            output_dir=args.output_dir,
+            num_samples=args.num_samples,
+            split=args.split,
+            seed=args.seed
+        )
 
 
 if __name__ == '__main__':
