@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
 """
-UniSCC Inference Script (v4.0)
+UniSCC Inference Script (v5.0)
 
-Run inference on single image pairs or directories with feature alignment.
+Run inference on single image pairs or directories with multi-scale architecture.
 
-v4.0 Features:
-- Feature alignment for bitemporal images (cross-attention, deformable, hierarchical)
-- Single semantic head (after-change prediction)
-- Shared semantic space between CD and captioning
+v5.0 Features:
+- Multi-scale hierarchical architecture with FPN
+- Hierarchical feature alignment across scales
+- Multi-task change detection head with magnitude estimation
+- Multi-level caption decoder
 
 Outputs:
-- change_map.npy: Semantic change map (after-change classes)
+- change_map.npy: Semantic change map
 - caption.txt: Generated change caption
 - viz.png: Visualization with all outputs
 
 Usage:
-    python inference.py --config configs/levir_mci.yaml \
+    # Single image pair
+    python inference.py --config configs/second_cc.yaml \
                         --checkpoint checkpoints/best.pth \
                         --image_a path/to/before.png \
                         --image_b path/to/after.png
 
+    # Directory with separate A/B folders (SECOND-CC structure)
     python inference.py --config configs/second_cc.yaml \
                         --checkpoint checkpoints/best.pth \
-                        --input_dir path/to/images/ \
+                        --dir_a E:/CD-Experiment/Datasets/SECOND-CC-AUG/test/rgb/A \
+                        --dir_b E:/CD-Experiment/Datasets/SECOND-CC-AUG/test/rgb/B \
+                        --output_dir outputs/
+
+    # Directory with separate A/B folders (LEVIR-MCI structure)
+    python inference.py --config configs/levir_mci.yaml \
+                        --checkpoint checkpoints/best.pth \
+                        --dir_a E:/CD-Experiment/Datasets/LEVIR-MCI-dataset/images/test/A \
+                        --dir_b E:/CD-Experiment/Datasets/LEVIR-MCI-dataset/images/test/B \
                         --output_dir outputs/
 """
 
@@ -114,15 +125,15 @@ class Inferencer:
             self.vocab.build_vocab([[w] for w in common_words])
 
     def _load_model(self, checkpoint_path: str):
-        """Load model from checkpoint with v4.0 configuration."""
+        """Load model from checkpoint with v5.0 configuration."""
         print(f"\n{'='*60}")
-        print(f"UniSCC v4.0 Inference - {self.dataset_name}")
+        print(f"UniSCC v5.0 Inference - {self.dataset_name}")
         print(f"{'='*60}\n")
 
         # Determine dataset type
         dataset_type = 'levir_mci' if self.is_levir else 'second_cc'
 
-        # Build model using v4.0 config with alignment
+        # Build model using v5.0 config with multi-scale architecture
         model_cfg = self.config.get('model', {})
         config = UniSCCConfig(
             dataset=dataset_type,
@@ -153,7 +164,7 @@ class Inferencer:
 
     @torch.no_grad()
     def predict(self, image_a: Image.Image, image_b: Image.Image) -> Dict[str, Any]:
-        """Run inference on image pair with v4.0 single semantic output."""
+        """Run inference on image pair with v5.0 multi-scale architecture."""
         # Transform images
         rgb_a, rgb_b, _ = self.transform(image_a, image_b, None)
         rgb_a = rgb_a.unsqueeze(0).to(self.device)
@@ -162,7 +173,7 @@ class Inferencer:
         # Forward pass
         outputs = self.model(rgb_a, rgb_b)
 
-        # v4.0: Get semantic change predictions (after-change classes)
+        # Get semantic change predictions
         cd_logits = outputs['cd_logits']
         cd_probs = F.softmax(cd_logits, dim=1)
         change_map = cd_logits.argmax(dim=1).squeeze(0).cpu().numpy()
@@ -195,7 +206,7 @@ class Inferencer:
     def colorize_map(self, change_map: np.ndarray) -> np.ndarray:
         """Convert change map to RGB.
 
-        v4.0: Both datasets output semantic class predictions directly:
+        Both datasets output semantic class predictions directly:
         - SECOND-CC: 7 after-change semantic classes
         - LEVIR-MCI: 3 semantic classes (no_change, building, road)
         """
@@ -214,7 +225,7 @@ class Inferencer:
         results: Dict[str, Any],
         save_path: Optional[str] = None
     ) -> plt.Figure:
-        """Create v4.0 visualization."""
+        """Create visualization for change detection results."""
         has_alignment = results.get('alignment_confidence') is not None
 
         if has_alignment:
@@ -261,7 +272,7 @@ class Inferencer:
             axes[3].set_title('Generated Caption', fontsize=12, fontweight='bold')
             axes[3].axis('off')
 
-        plt.suptitle('UniSCC v4.0 - Feature Alignment', fontsize=14, fontweight='bold')
+        plt.suptitle('UniSCC v5.0 - Multi-Scale Architecture', fontsize=14, fontweight='bold')
         plt.tight_layout()
 
         if save_path:
@@ -277,7 +288,7 @@ class Inferencer:
         output_dir: str,
         output_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Process a single image pair with v4.0 outputs."""
+        """Process a single image pair and save outputs."""
         # Load images
         image_a = Image.open(image_a_path).convert('RGB')
         image_b = Image.open(image_b_path).convert('RGB')
@@ -305,6 +316,58 @@ class Inferencer:
 
         return results
 
+    def process_directory_pair(
+        self,
+        dir_a: str,
+        dir_b: str,
+        output_dir: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Process all image pairs from separate A and B directories.
+
+        This handles the standard bitemporal dataset structure:
+        - SECOND-CC: root/split/rgb/A/*.png and root/split/rgb/B/*.png
+        - LEVIR-MCI: root/images/split/A/*.png and root/images/split/B/*.png
+
+        Args:
+            dir_a: Directory containing before (t0) images
+            dir_b: Directory containing after (t1) images
+            output_dir: Output directory for results
+        """
+        dir_a = Path(dir_a)
+        dir_b = Path(dir_b)
+        results_list = []
+
+        # Find all images in dir_a
+        image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff']
+        images_a = []
+        for ext in image_extensions:
+            images_a.extend(dir_a.glob(ext))
+        images_a = sorted(images_a)
+
+        if not images_a:
+            print(f"Warning: No images found in {dir_a}")
+            return results_list
+
+        print(f"Found {len(images_a)} images in {dir_a}")
+
+        for img_a_path in images_a:
+            # Look for matching image in dir_b with same filename
+            img_b_path = dir_b / img_a_path.name
+
+            if not img_b_path.exists():
+                print(f"Warning: No matching image in B for {img_a_path.name}")
+                continue
+
+            name = img_a_path.stem
+            print(f"Processing: {name}")
+
+            results = self.process_pair(str(img_a_path), str(img_b_path), output_dir, name)
+            results_list.append(results)
+
+        print(f"\nProcessed {len(results_list)} image pairs")
+        return results_list
+
     def process_directory(
         self,
         input_dir: str,
@@ -312,7 +375,7 @@ class Inferencer:
         pattern_a: str = '*_A.png',
         pattern_b: str = '*_B.png'
     ) -> List[Dict[str, Any]]:
-        """Process all image pairs in directory."""
+        """[Deprecated] Process image pairs using filename patterns."""
         input_dir = Path(input_dir)
         results_list = []
 
@@ -336,21 +399,42 @@ class Inferencer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='UniSCC v4.0 Inference')
+    parser = argparse.ArgumentParser(description='UniSCC v5.0 Inference')
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--image_a', type=str, default=None)
-    parser.add_argument('--image_b', type=str, default=None)
-    parser.add_argument('--input_dir', type=str, default=None)
+
+    # Single image pair
+    parser.add_argument('--image_a', type=str, default=None,
+                       help='Path to before image (t0)')
+    parser.add_argument('--image_b', type=str, default=None,
+                       help='Path to after image (t1)')
+
+    # Directory-based input (folder structure with A/ and B/ subdirs)
+    parser.add_argument('--dir_a', type=str, default=None,
+                       help='Directory containing before images (e.g., test/rgb/A for SECOND-CC)')
+    parser.add_argument('--dir_b', type=str, default=None,
+                       help='Directory containing after images (e.g., test/rgb/B for SECOND-CC)')
+
+    # Legacy: pattern-based matching (deprecated)
+    parser.add_argument('--input_dir', type=str, default=None,
+                       help='[Deprecated] Use --dir_a and --dir_b instead')
+
     parser.add_argument('--output_dir', type=str, default='./outputs')
     args = parser.parse_args()
 
     # Validate input
-    if args.image_a is None and args.input_dir is None:
-        parser.error("Either --image_a/--image_b or --input_dir required")
+    has_single_pair = args.image_a is not None
+    has_dir_pair = args.dir_a is not None and args.dir_b is not None
+    has_legacy = args.input_dir is not None
 
-    if args.image_a and not args.image_b:
+    if not (has_single_pair or has_dir_pair or has_legacy):
+        parser.error("Provide either --image_a/--image_b OR --dir_a/--dir_b")
+
+    if has_single_pair and not args.image_b:
         parser.error("--image_b required with --image_a")
+
+    if (args.dir_a is None) != (args.dir_b is None):
+        parser.error("Both --dir_a and --dir_b must be provided together")
 
     # Load config
     config = load_config(args.config)
@@ -359,11 +443,14 @@ def main():
     inferencer = Inferencer(config, args.checkpoint)
 
     # Run inference
-    if args.input_dir:
+    if has_dir_pair:
+        inferencer.process_directory_pair(args.dir_a, args.dir_b, args.output_dir)
+    elif has_legacy:
+        print("Warning: --input_dir is deprecated. Use --dir_a and --dir_b instead.")
         inferencer.process_directory(args.input_dir, args.output_dir)
     else:
         results = inferencer.process_pair(args.image_a, args.image_b, args.output_dir)
-        print(f"\n=== v4.0 Results ===")
+        print(f"\n=== v5.0 Results ===")
         print(f"Caption: {results['caption']}")
         print(f"Change map shape: {results['change_map'].shape}")
         if results.get('alignment_confidence') is not None:

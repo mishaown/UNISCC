@@ -2,12 +2,13 @@
 
 A unified framework for joint Semantic Change Detection (SCD) and Change Captioning (CC) on remote sensing imagery.
 
-## v4.0 Features
+## v5.0 Features
 
-- **Feature Alignment**: Cross-attention, deformable, or hierarchical alignment for bitemporal images
-- **Single Semantic Head**: Predicts after-change semantic classes with shared CD-captioning space
-- **Learnable Semantic Prompts**: CLIP-initialized prompts for semantic-aware feature enhancement
-- **Optimized Training**: cuDNN benchmark, non-blocking transfers, persistent workers
+- **Multi-Scale Architecture**: Hierarchical feature pyramid with 4 scales for multi-resolution change detection
+- **Hierarchical Alignment**: Cross-scale feature alignment between bitemporal images
+- **Multi-Task CD Head**: Semantic change prediction with magnitude estimation
+- **Multi-Level Caption Decoder**: Scale-aware caption generation
+- **Change-Aware Attention**: Spatial attention guided by change magnitude
 
 ## Supported Datasets
 
@@ -43,14 +44,13 @@ pip install -r requirements.txt
 from src import UniSCC, UniSCCConfig
 import torch
 
-# Create model with v4.0 feature alignment
+# Create model with v5.0 multi-scale architecture
 config = UniSCCConfig(
     dataset='second_cc',
     vocab_size=10000,
     pretrained=True,
-    use_alignment=True,
-    alignment_type='cross_attention',  # or 'deformable', 'hierarchical'
-    alignment_heads=8
+    use_pyramid=True,
+    num_scales=4,
 )
 model = UniSCC(config)
 
@@ -64,10 +64,10 @@ lengths = torch.tensor([30, 25])
 model.train()
 outputs = model(img_t0, img_t1, captions, lengths)
 
-# v4.0 outputs
+# v5.0 outputs
 cd_logits = outputs['cd_logits']              # [B, K, 256, 256] semantic change map
 caption_logits = outputs['caption_logits']    # [B, T, V]
-alignment_conf = outputs['alignment_confidence']  # [B, H, W] confidence map
+magnitude = outputs.get('magnitude')          # [B, 1, 256, 256] change magnitude
 
 # Inference
 model.eval()
@@ -79,7 +79,8 @@ with torch.no_grad():
 ### Run Tests
 
 ```bash
-python test_v4.py
+python test_model.py
+python test_data.py
 ```
 
 ## Project Structure
@@ -87,22 +88,26 @@ python test_v4.py
 ```
 UniSCC/
 ├── configs/
-│   ├── second_cc.yaml
-│   └── levir_mci.yaml
+│   ├── second_cc.yaml          # SECOND-CC v5.0 config
+│   ├── levir_mci.yaml          # LEVIR-MCI v5.0 config
+│   ├── second_cc_linux.yaml    # Linux paths
+│   └── levir_mci_linux.yaml    # Linux paths
 ├── src/
-│   ├── encoder.py           # Siamese Swin Transformer
-│   ├── alignment.py         # Feature alignment modules (v4.0)
-│   ├── tdt.py               # Temporal Difference Transformer
-│   ├── lsp.py               # Learnable Semantic Prompts
-│   ├── semantic_head.py     # Semantic Change Detection Head
-│   ├── caption_decoder.py   # Semantic Caption Decoder
-│   ├── uniscc.py            # Main model (v4.0)
+│   ├── encoder.py              # Siamese Swin Transformer
+│   ├── fpn.py                  # Feature Pyramid Network
+│   ├── hierarchical_alignment.py   # Multi-scale alignment
+│   ├── multi_scale_tdt.py      # Multi-scale Temporal Difference Transformer
+│   ├── change_aware_attention.py   # Change-guided attention
+│   ├── hierarchical_lsp.py     # Hierarchical Learnable Semantic Prompts
+│   ├── multi_task_cd_head.py   # Multi-task CD head with magnitude
+│   ├── multi_level_caption_decoder.py  # Scale-aware caption decoder
+│   ├── uniscc_v5.py            # Main model (v5.0)
 │   └── __init__.py
 ├── data/
-│   ├── second_cc.py         # SECOND-CC dataset with RGB label handling
-│   ├── levir_mci.py
-│   ├── vocabulary.py
-│   └── transforms.py
+│   ├── second_cc.py            # SECOND-CC dataset with RGB label handling
+│   ├── levir_mci.py            # LEVIR-MCI dataset
+│   ├── vocabulary.py           # Caption vocabulary
+│   └── transforms.py           # Image transforms
 ├── losses/
 │   ├── caption_loss.py
 │   └── scd_loss.py
@@ -116,10 +121,10 @@ UniSCC/
 
 ## Training
 
-### Optimized Training (Default)
+### Training Commands
 
 ```bash
-# SECOND-CC (batch=4, accum=3, effective=12)
+# SECOND-CC (batch=2, accum=6, effective=12)
 python train.py --config configs/second_cc.yaml
 
 # LEVIR-MCI
@@ -133,9 +138,9 @@ python train.py --config configs/second_cc.yaml --resume checkpoints/last.pth
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `batch_size` | 4 | Batch size per step |
-| `gradient_accumulation_steps` | 3 | Accumulation steps (effective batch=12) |
-| `gradient_checkpointing` | false | Trade compute for memory (enable if OOM) |
+| `batch_size` | 2 | Batch size per step (reduced for v5.0) |
+| `gradient_accumulation_steps` | 6 | Accumulation steps (effective batch=12) |
+| `gradient_checkpointing` | true | Required for v5.0 due to larger model |
 | `num_workers` | 8 | DataLoader workers |
 | `amp.enabled` | true | Mixed precision training |
 
@@ -147,11 +152,14 @@ python evaluate.py --config configs/second_cc.yaml \
                    --split test
 ```
 
-### v4.0 Evaluation Output
-- **CD metrics**: mIoU, F1, OA for after-change semantic prediction
+### Evaluation Metrics
+- **CD metrics**: mIoU, F1, OA, boundary_IoU
 - **Caption metrics**: BLEU-1/2/3/4, METEOR, ROUGE-L, CIDEr
+- **Magnitude metrics**: MSE, MAE
 
 ## Inference
+
+### Single Image Pair
 
 ```bash
 python inference.py --config configs/second_cc.yaml \
@@ -161,47 +169,70 @@ python inference.py --config configs/second_cc.yaml \
                     --output_dir outputs/
 ```
 
-### v4.0 Inference Outputs
-- `*_change_map.npy`: Semantic change map (after-change classes)
+### Directory Batch Processing
+
+Both datasets use folder-based organization with separate A/ and B/ directories:
+
+```bash
+# SECOND-CC dataset structure: root/split/rgb/A/ and root/split/rgb/B/
+python inference.py --config configs/second_cc.yaml \
+                    --checkpoint checkpoints/best.pth \
+                    --dir_a E:/CD-Experiment/Datasets/SECOND-CC-AUG/test/rgb/A \
+                    --dir_b E:/CD-Experiment/Datasets/SECOND-CC-AUG/test/rgb/B \
+                    --output_dir outputs/
+
+# LEVIR-MCI dataset structure: root/images/split/A/ and root/images/split/B/
+python inference.py --config configs/levir_mci.yaml \
+                    --checkpoint checkpoints/best.pth \
+                    --dir_a E:/CD-Experiment/Datasets/LEVIR-MCI-dataset/images/test/A \
+                    --dir_b E:/CD-Experiment/Datasets/LEVIR-MCI-dataset/images/test/B \
+                    --output_dir outputs/
+```
+
+### Inference Outputs
+- `*_change_map.npy`: Semantic change map
 - `*_caption.txt`: Generated caption
 - `*_viz.png`: Visualization
 
-## Model Architecture (v4.0)
+## Model Architecture (v5.0)
 
 ```
 img_t0, img_t1 [B,3,256,256]
        │
        ▼
 ┌──────────────────────┐
-│ Encoder (Swin-B)     │──► feat_t0, feat_t1 [B,1024,8,8]
+│ Encoder (Swin-B)     │──► Multi-scale features
+│ + FPN                │    P2[64], P3[32], P4[16], P5[8]
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ Feature Alignment    │──► aligned_t0, aligned_t1 + confidence
-│ (Cross-Attention)    │
+│ Hierarchical         │──► Aligned features per scale
+│ Alignment            │    + skip connections
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ TDT (3 layers)       │──► diff_features [B,512,8,8]
+│ Multi-Scale TDT      │──► Difference features per scale
+│ (2 layers/scale)     │    with change-aware attention
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ Learnable Semantic   │──► semantic_features [B,512,8,8]
-│ Prompts (CLIP-init)  │
+│ Hierarchical LSP     │──► Scale-aware semantic prompts
+│ (CLIP-initialized)   │
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ Semantic Change Head │──► cd_logits [B,K,256,256]
+│ Multi-Task CD Head   │──► cd_logits [B,K,256,256]
+│ (with magnitude)     │    magnitude [B,1,256,256]
 └──────────────────────┘
        │
        ▼
 ┌──────────────────────┐
-│ Caption Decoder      │──► caption_logits [B,T,V]
-│ (Shared Semantic)    │
+│ Multi-Level Caption  │──► caption_logits [B,T,V]
+│ Decoder              │
 └──────────────────────┘
 ```
 
@@ -217,15 +248,15 @@ UniSCCConfig(
     pretrained=True,
     feature_dim=512,
 
-    # v4.0 Alignment
-    use_alignment=True,
-    alignment_type='cross_attention',  # 'cross_attention', 'deformable', 'hierarchical'
-    alignment_heads=8,
+    # v5.0 Multi-scale
+    use_pyramid=True,
+    pyramid_channels=256,
+    num_scales=4,
 
     # Architecture
-    tdt_layers=3,
+    tdt_layers=2,                     # Per-scale layers
     decoder_layers=6,
-    num_semantic_classes=7,           # SECOND-CC after-change classes
+    num_semantic_classes=7,           # SECOND-CC classes
     num_change_classes=3,             # LEVIR-MCI classes
 
     # Caption
@@ -234,13 +265,41 @@ UniSCCConfig(
 )
 ```
 
-## Alignment Types
+## Dataset Directory Structure
 
-| Type | Description | Best For |
-|------|-------------|----------|
-| `cross_attention` | Query from t1, Key/Value from t0 | General use, best quality |
-| `deformable` | Learnable spatial offsets | Large misalignments |
-| `hierarchical` | Multi-scale alignment | Multi-resolution changes |
+### SECOND-CC
+```
+SECOND-CC-AUG/
+├── SECOND-CC-AUG.json    # Annotations with splits
+├── train/
+│   ├── rgb/
+│   │   ├── A/            # Before images
+│   │   └── B/            # After images
+│   └── sem/
+│       ├── A/            # Before semantic maps
+│       └── B/            # After semantic maps
+├── val/
+│   └── ...
+└── test/
+    └── ...
+```
+
+### LEVIR-MCI
+```
+LEVIR-MCI-dataset/
+├── cls_LEVIR_MCI.json    # Annotations
+├── images/
+│   ├── train/
+│   │   ├── A/            # Before images
+│   │   ├── B/            # After images
+│   │   ├── label/        # Binary change masks
+│   │   └── label_rgb/    # RGB change masks
+│   ├── val/
+│   │   └── ...
+│   └── test/
+│       └── ...
+└── ...
+```
 
 ## Performance Optimization
 
@@ -251,8 +310,6 @@ UniSCCConfig(
 | Mixed Precision (AMP) | ~50% memory reduction | Minimal |
 | cuDNN Benchmark | Faster convolutions | First batch slower |
 | Persistent Workers | Faster data loading | Higher memory |
-
-Adjust `batch_size` and `gradient_accumulation_steps` in config based on available memory.
 
 ## License
 
